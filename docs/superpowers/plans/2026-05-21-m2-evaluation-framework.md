@@ -1165,6 +1165,7 @@ import numpy as np
 import pytest
 
 from face_recognition.domain.entities import FaceEncoding
+from face_recognition.domain.errors import NoFaceError
 from face_recognition.evaluation.embedder import (
     encode_image_paths,
     encode_lfw_images,
@@ -1188,12 +1189,14 @@ def test_encode_image_paths_returns_one_eval_encoding_per_path(tmp_path: Path):
         p.write_bytes(b"fake")
         paths.append(p)
 
-    # mock pipeline：前两张返回向量，第三张返回 None（无脸）
+    # mock pipeline：前两张正常返回向量，第三张抛 NoFaceError 模拟"无脸"
+    # —— M1 约定 FacePipeline.encode_single 检测不到脸时**抛异常**而非返回 None
     pipeline = MagicMock()
     fe1 = FaceEncoding(vector=_unit_vec(0), model_version="buffalo_l")
     fe2 = FaceEncoding(vector=_unit_vec(1), model_version="buffalo_l")
-    # side_effect 让连续调用返回不同结果，M1 已讲过的机制
-    pipeline.encode_single.side_effect = [fe1, fe2, None]
+    # side_effect 接列表时按调用顺序逐项产出；元素若是 Exception 实例则被 raise
+    # 这是 MagicMock 的特殊语义（M1 测试已用过同款套路）
+    pipeline.encode_single.side_effect = [fe1, fe2, NoFaceError("无脸")]
 
     result = encode_image_paths(pipeline, paths, person_id="alice")
     assert len(result) == 2  # 第三张被跳过
@@ -1214,6 +1217,14 @@ def test_encode_lfw_images_uses_person_name_as_id():
     assert len(result) == 1
     assert result[0].person_id == "George_W_Bush"
     assert result[0].image_path.startswith("lfw://")
+
+
+def test_encode_lfw_images_skips_no_face():
+    """无脸 LFW 图（罕见但要防御）：抛 NoFaceError 时跳过。"""
+    pipeline = MagicMock()
+    pipeline.encode_single.side_effect = NoFaceError("无脸")
+    lfw_imgs = [LfwImage(image=np.zeros((250, 250, 3), dtype=np.uint8), person_name="Ghost")]
+    assert encode_lfw_images(pipeline, lfw_imgs) == []
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1232,6 +1243,7 @@ import cv2
 import numpy as np
 
 # 复用 M1 的 FacePipeline Protocol——评估只是另一个调用方
+from face_recognition.domain.errors import NoFaceError
 from face_recognition.domain.interfaces import FacePipeline
 from face_recognition.evaluation.lfw_loader import LfwImage
 from face_recognition.evaluation.types import EvalEncoding
@@ -1255,9 +1267,13 @@ def encode_image_paths(
         if img is None:
             logger.warning("无法读取图片，跳过：%s", p)
             continue
-        face = pipeline.encode_single(img)
-        if face is None:
-            # 检测不到脸——常见于侧脸/遮挡严重，评估不该让它扭曲分数分布
+        # M1 约定：FacePipeline.encode_single 在检测不到脸时**抛 NoFaceError**，
+        # 不是返回 None。评估侧捕获该异常并跳过——单张失败不应中断整个流水线。
+        # try/except 缩到最小范围（只包 encode_single 这一行）：
+        # 把 EvalEncoding 构造放外面，避免把它的错误也吞掉
+        try:
+            face = pipeline.encode_single(img)
+        except NoFaceError:
             logger.warning("未检测到人脸，跳过：%s", p)
             continue
         out.append(EvalEncoding(
@@ -1282,8 +1298,9 @@ def encode_lfw_images(
         # cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) = numpy 切片 [..., ::-1] 的等价语义
         # 选 cvtColor 更显式，读代码的人一眼看出"在做色彩空间转换"
         bgr = cv2.cvtColor(lfw.image, cv2.COLOR_RGB2BGR)
-        face = pipeline.encode_single(bgr)
-        if face is None:
+        try:
+            face = pipeline.encode_single(bgr)
+        except NoFaceError:
             logger.warning("LFW 图未检测到脸，跳过：%s", lfw.person_name)
             continue
         out.append(EvalEncoding(
@@ -1301,7 +1318,7 @@ def encode_lfw_images(
 uv run pytest tests/unit/evaluation/test_embedder.py -v
 ```
 
-预期：2 passed
+预期：3 passed
 
 - [ ] **Step 5: commit**
 
@@ -1417,14 +1434,17 @@ uv run pytest tests/integration/test_run_ablation.py -v -m slow
 import logging
 from pathlib import Path
 
-# 5 个策略来自 M1 application 层，评估直接复用
-from face_recognition.application.strategies import (
-    AllVectorsStrategy,
-    KMeansK3Strategy,
-    ManualThreeStrategy,
-    MeanAllStrategy,
-    RandomOneStrategy,
-)
+import numpy as np
+
+# 5 个策略来自 M1 application 层，**各自一个子模块**——M1 没写
+# `application/strategies/__init__.py` 的 re-export，所以这里必须按子模块路径分别 import。
+# 如果以后想批量 import，可在 M1 里给 strategies/__init__.py 加 `from .random_one import ...`
+from face_recognition.application.strategies.all_vectors import AllVectorsStrategy
+from face_recognition.application.strategies.kmeans_k3 import KMeansK3Strategy
+from face_recognition.application.strategies.manual_three import ManualThreeStrategy
+from face_recognition.application.strategies.mean_all import MeanAllStrategy
+from face_recognition.application.strategies.random_one import RandomOneStrategy
+from face_recognition.domain.entities import FaceEncoding
 from face_recognition.domain.interfaces import FacePipeline, TemplateStrategy
 from face_recognition.evaluation import lfw_loader, reports
 from face_recognition.evaluation.data_split import PersonSplit, split_by_person
@@ -1444,14 +1464,15 @@ from face_recognition.evaluation.types import EvalEncoding, PairResult, Strategy
 logger = logging.getLogger(__name__)
 
 
-# 5 个策略以"名字 → 实例"映射列出，方便循环消融
-# Strategy 实例化在这里完成——它们都是无状态的（k=3 等参数已封死在类里），可以共享
-def _all_strategies() -> dict[str, TemplateStrategy]:
+# 5 个策略以"名字 → 实例"映射列出，方便循环消融。
+# RandomOneStrategy / KMeansK3Strategy 构造时要传 seed（M1 dependencies.build_strategy 同款做法）；
+# 其余三个无参。
+def _all_strategies(seed: int) -> dict[str, TemplateStrategy]:
     return {
-        "random_one": RandomOneStrategy(),
+        "random_one": RandomOneStrategy(seed=seed),
         "mean_all": MeanAllStrategy(),
         "manual_three": ManualThreeStrategy(),
-        "kmeans_k3": KMeansK3Strategy(),
+        "kmeans_k3": KMeansK3Strategy(seed=seed),
         "all_vectors": AllVectorsStrategy(),
     }
 
@@ -1463,21 +1484,27 @@ def _select_one_template_per_person(
 ) -> EvalEncoding | None:
     """跑一个策略，把训练集压缩成"代表向量"。
 
-    策略可能返回 1 个（mean_all）或多个（kmeans_k3=3、all_vectors=N）模板。
+    策略可能返回 1 个（mean_all）或多个（kmeans_k3=3、all_vectors=N）Template。
     评估指标按"每人 1 个代表向量"算 ROC——多模板的策略取平均向量再归一化作为代表。
     这是评估侧的简化口径，**不**影响生产侧的多模板检索。
     """
     if not train_encodings:
         return None
-    # 调用策略的 build_templates 接口（M1 已定义）
-    # 返回值是 list[FaceEncoding]，长度由策略决定
-    vectors = [enc.vector for enc in train_encodings]
-    # 策略接口签名：build_templates(vectors: list[np.ndarray]) -> list[np.ndarray]
-    template_vectors = strategy.build_templates(vectors)
-    if not template_vectors:
+
+    # M1 定义的策略接口签名（domain/interfaces.py）：
+    #   def build(self, encodings: list[FaceEncoding]) -> list[Template]
+    # 入参是 FaceEncoding（带 model_version），出参是 Template（带 encoding/source/created_at）。
+    # 评估侧手头是 EvalEncoding，需要先映射到 FaceEncoding 再传给策略。
+    fe_list = [
+        FaceEncoding(vector=e.vector, model_version="buffalo_l")
+        for e in train_encodings
+    ]
+    templates = strategy.build(fe_list)
+    if not templates:
         return None
 
-    import numpy as np
+    # Template 里的向量在 .encoding.vector，先抽出来再聚合
+    template_vectors = [t.encoding.vector for t in templates]
     # 多个模板向量求平均 + L2 归一化 → 单个代表向量
     # 这是评估口径的近似；生产识别时 5 策略各自的检索逻辑由 application 层负责
     avg = np.mean(template_vectors, axis=0)
@@ -1529,7 +1556,7 @@ def run_ablation(
     # 在每策略循环里我们要把 pairs 也存下来给直方图用
     pairs_per_strategy: dict[str, list[PairResult]] = {}
 
-    for name, strategy in _all_strategies().items():
+    for name, strategy in _all_strategies(seed).items():
         logger.info("  策略：%s", name)
         # 4.1 用策略压缩每个人 train_set → 1 个代表向量
         templates: dict[str, EvalEncoding] = {}
@@ -1591,7 +1618,11 @@ uv run pytest tests/integration/test_run_ablation.py -v -m slow
 
 - [ ] **Step 5: 加 CLI 入口**
 
-修改 `src/face_recognition/api/cli.py`，添加新命令 `evaluate`：
+修改 `src/face_recognition/api/cli.py`，添加新命令 `evaluate`。
+
+> 注意：M1 的 `_setup` callback 把 `AppConfig` 实例放到 `ctx.obj`（不是装配好的容器）。
+> 其他子命令（`register` / `recognize`）的套路都是 `cfg = ctx.obj` → 调 `build_xxx_use_case(cfg)`
+> 现场装配。`evaluate` 沿用同款套路：拿 cfg → 调 `build_pipeline(cfg)` 现造 pipeline。
 
 ```python
 # 在 cli.py 已有的 import 之后追加
@@ -1599,6 +1630,7 @@ from pathlib import Path
 
 import typer
 
+from face_recognition.api.dependencies import build_pipeline
 from face_recognition.evaluation.run_ablation import run_ablation
 
 
@@ -1611,13 +1643,15 @@ def evaluate(
     n_lfw: int = typer.Option(50, help="LFW 抽样人数"),
 ) -> None:
     """跑 5 策略消融评估，产出 ROC/EER/TAR\\@FAR 报告。"""
-    # ctx.obj 是 M1 dependencies 已经装配好的容器，里头有 pipeline
-    pipeline = ctx.obj.pipeline
+    # ctx.obj 是 M1 _setup 塞进去的 AppConfig，跟 register/recognize 子命令同款
+    cfg = ctx.obj
+    pipeline = build_pipeline(cfg)
     run_ablation(
         dataset_root=dataset,
         output_dir=output,
         pipeline=pipeline,
         n_lfw=n_lfw,
+        seed=cfg.evaluation.random_seed,
     )
     typer.echo(f"报告已写到 {output}/summary.md")
 ```
