@@ -96,10 +96,18 @@ tests/
 - [ ] **Step 1: 写失败的测试 `tests/unit/test_entities.py`**
 
 ```python
+# numpy 是 Python 科学计算的事实标准库，约定别名 np
+# 我们用它造测试向量、检查范数等
 import numpy as np
+
+# pytest 是 Python 最流行的测试框架。这里 import 它本身是为了用 pytest.raises / pytest.approx
 import pytest
+
+# datetime 用来给 Template 加"创建时间"字段
 from datetime import datetime
 
+# 从我们要实现的模块里导入 4 个实体类
+# 注意：这一行会失败（因为 entities.py 还是空的）——这正是 TDD"先写失败测试"的重点
 from face_recognition.domain.entities import (
     FaceEncoding,
     Template,
@@ -109,51 +117,111 @@ from face_recognition.domain.entities import (
 
 
 def _unit_vector(seed: int = 0) -> np.ndarray:
+    """生成一个 L2 归一化的随机 512 维向量，用于测试时模拟 ArcFace 输出。
+
+    "L2 归一化" = 向量除以它自己的长度，使最终长度为 1。
+    几何意义：把向量"压"到单位球面上，方向不变、长度统一为 1。
+    ArcFace 真实输出也是单位球面上的向量，所以测试用同样形态来模拟最逼真。
+
+    函数名前的下划线 `_` 是 Python 约定的"模块私有"标志——
+    告诉读者"这是测试内部辅助函数，不要从外面 import 它"。
+    """
+
+    # np.random.default_rng(seed) 是 NumPy 1.17+ 推荐的随机数生成器构造方式
+    #   - 旧 API 是 np.random.seed(...)（修改全局状态，多线程下相互干扰）
+    #   - 新 API 返回一个独立的 Generator 对象，互不影响
+    #   - seed 相同时生成的"随机"数完全一样——保证测试可复现
     rng = np.random.default_rng(seed)
+
+    # rng.standard_normal(N) = 从标准正态分布 N(0, 1) 抽 N 个独立样本
+    #   - 标准正态：均值 0、方差 1 的钟形分布
+    #   - 为什么不用 rng.random()（[0, 1) 均匀分布）？
+    #     正态分布在每个维度上对称地分散，归一化后向量在球面上分布更均匀；
+    #     均匀分布会让向量倾向某些角落，对模拟"特征向量"不真实
+    # .astype(np.float32) = 把数组类型转成 32 位浮点
+    #   - NumPy 默认是 float64（双精度）；ArcFace 实际输出是 float32
+    #   - 强制对齐 float32 让测试与生产环境的数值精度一致
     v = rng.standard_normal(512).astype(np.float32)
+
+    # np.linalg.norm(v) 默认计算 L2 范数 = sqrt(v[0]² + v[1]² + ... + v[511]²)
+    #   - "linalg" = "linear algebra"（线性代数）模块缩写
+    #   - 想算别的范数可传 ord=1（绝对值之和）或 ord=np.inf（最大绝对值）
+    #   - 对 512 维向量结果是它的"长度"，恒为正数
+    # v / norm 用 NumPy 的"广播（broadcasting）"：标量除向量等于逐元素除
+    #   - 等价于 [v[0]/norm, v[1]/norm, ..., v[511]/norm]
+    #   - 除完后向量的 L2 范数严格等于 1（除浮点误差）
     return v / np.linalg.norm(v)
 
 
+# 测试函数命名约定：以 test_ 开头 pytest 才会自动发现并执行
 def test_face_encoding_requires_512_dim():
+    """构造 FaceEncoding 时如果维度不是 512，应抛 ValueError。"""
+    # pytest.raises(ExpectedException) 是 pytest 提供的"断言异常"上下文管理器
+    #   - 如果 with 块内代码抛了 ValueError，测试通过
+    #   - 如果没抛任何异常 / 抛了别的异常，测试失败
+    # np.zeros(128, dtype=np.float32) 创建一个全 0 的 128 维 float32 向量
+    #   - 维度 128 != 512，应触发我们的校验逻辑
     with pytest.raises(ValueError):
         FaceEncoding(vector=np.zeros(128, dtype=np.float32), model_version="buffalo_l")
 
 
 def test_face_encoding_requires_l2_normalized():
+    """构造 FaceEncoding 时如果向量没有 L2 归一化，应抛 ValueError。"""
+    # np.ones(512) 是全 1 向量，它的 L2 范数 = sqrt(512) ≈ 22.63，远不为 1
+    # 这种"未归一化"的向量进入领域层是 bug，必须拦下
     with pytest.raises(ValueError):
         FaceEncoding(vector=np.ones(512, dtype=np.float32), model_version="buffalo_l")
 
 
 def test_face_encoding_cosine_similarity_self_is_one():
+    """同一个 FaceEncoding 与自己的余弦相似度应该是 1.0。"""
     enc = FaceEncoding(vector=_unit_vector(0), model_version="buffalo_l")
+    # pytest.approx 用于浮点近似比较——直接 == 1.0 在浮点世界几乎永远不成立
+    #   - abs=1e-6 表示允许 ±0.000001 的误差
+    #   - 也可以传 rel=1e-6 用相对误差
     assert enc.cosine_similarity(enc) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_face_encoding_cosine_similarity_orthogonal_is_zero():
+    """两个互相正交（垂直）的单位向量，余弦相似度应该是 0。"""
+    # 构造两个特殊的单位向量：v1 沿 x 轴方向，v2 沿 y 轴方向，互相正交
     v1 = np.zeros(512, dtype=np.float32)
-    v1[0] = 1.0
+    v1[0] = 1.0  # 第 0 维 = 1，其他全 0；它的 L2 范数 = 1，是合法 unit vector
     v2 = np.zeros(512, dtype=np.float32)
     v2[1] = 1.0
     e1 = FaceEncoding(vector=v1, model_version="buffalo_l")
     e2 = FaceEncoding(vector=v2, model_version="buffalo_l")
+    # 正交向量点积 = 0，因此余弦相似度 = 0
+    # 这测试除了功能正确，还顺便验证 cosine_similarity 用的是点积公式
     assert e1.cosine_similarity(e2) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_face_encoding_is_frozen():
+    """frozen dataclass 的字段不可修改，赋值会抛异常。"""
     enc = FaceEncoding(vector=_unit_vector(0), model_version="buffalo_l")
+    # 注释 # FrozenInstanceError 解释：dataclasses 模块定义的专用异常
+    # 它继承自 AttributeError；这里用宽泛的 Exception 是因为不想让测试和具体异常类型耦合
     with pytest.raises(Exception):  # FrozenInstanceError
         enc.model_version = "other"
 
 
 def test_person_templates_must_be_tuple():
+    """Person.templates 必须是 tuple（不可变），不是 list。"""
     enc = FaceEncoding(vector=_unit_vector(0), model_version="buffalo_l")
+    # Template 三个字段都给齐：encoding / source / created_at
+    # datetime.now() 拿当前时间；测试里用什么时间无所谓
     tpl = Template(encoding=enc, source="test", created_at=datetime.now())
+    # (tpl,) 是单元素元组；写 (tpl) 会被解析成普通括号表达式而非元组
+    # 这是 Python 容易踩的坑：单元素元组必须有逗号
     person = Person(person_id="alice", display_name="Alice", templates=(tpl,))
+    # isinstance(x, T) 判断 x 是否为 T 类型（包括子类）
     assert isinstance(person.templates, tuple)
 
 
 def test_recognition_result_unknown_has_none_person_id():
+    """识别结果"未知"时 person_id 应是 None，相似度低于阈值。"""
     r = RecognitionResult(person_id=None, similarity=0.3, threshold=0.45)
+    # is None 比 == None 更好：is 比较"同一对象"，是 None 检测的官方推荐写法
     assert r.person_id is None
     assert r.similarity < r.threshold
 ```
@@ -169,52 +237,131 @@ uv run pytest tests/unit/test_entities.py -v
 - [ ] **Step 3: 实现 `src/face_recognition/domain/entities.py`**
 
 ```python
+# dataclasses 是 Python 3.7+ 标准库，让定义"只装数据的类"少写一堆样板代码
+# 没有它你要手写 def __init__(self, x, y): self.x = x; self.y = y; ... 一长串
 from dataclasses import dataclass
+
+# datetime 类型用于 Template.created_at 字段
 from datetime import datetime
 
 import numpy as np
 
-_EMBED_DIM = 512
-_NORM_TOLERANCE = 1e-3
+# ===== 模块级常量 =====
+# 下划线开头是 Python 约定的"私有"标志，不会被 from xxx import * 导出
+_EMBED_DIM = 512                # ArcFace ResNet100 输出向量维度，buffalo_l 模型固定为 512
+_NORM_TOLERANCE = 1e-3          # L2 范数容忍度：理论 ||v||=1，浮点实际可能是 0.9999~1.0001 都接受
 
 
+# ===== FaceEncoding：领域层最核心的实体 =====
+# @dataclass 是装饰器，作用是给 class 自动生成几个常用方法：
+#   - __init__   构造函数（按字段顺序接参）
+#   - __repr__   打印表示（FaceEncoding(vector=..., model_version='buffalo_l')）
+#   - __eq__     相等比较
+# 不用它你要手写每一个，几十行的样板代码
+#
+# frozen=True 让实例创建后所有字段不可修改：
+#   - 给字段赋值会抛 dataclasses.FrozenInstanceError
+#   - 这正是"领域实体不可变"原则的代码体现——避免被外部代码偷偷改坏导致难追的 bug
 @dataclass(frozen=True)
 class FaceEncoding:
+    """ArcFace 对一张人脸输出的 512 维特征向量（已 L2 归一化）。
+
+    设计要点：
+    - vector 必须 (512,) float32 且 ||v|| ≈ 1
+    - 归一化后两个 encoding 的余弦相似度 = 它们的点积，范围 [-1, 1]
+    - 这是整个识别系统的"通用货币"——所有相似度计算都基于它
+
+    "model_version" 字段记录这个向量是哪个模型出的；将来切换模型时
+    可以拒绝跨模型比对（比如 buffalo_l 的向量不能和 buffalo_s 的混着比）
+    """
+
+    # 用类型注解声明字段，dataclass 据此生成 __init__
+    # np.ndarray 是 NumPy 数组类型；shape/dtype 在 __post_init__ 中校验
     vector: np.ndarray
     model_version: str
 
+    # __post_init__ 是 dataclass 提供的特殊方法：自动生成的 __init__ 跑完后会调用它
+    # 用途：在构造结束后做字段校验。如果字段不合法，抛异常拦截构造
+    # 这是"在系统边界做校验"的核心实践——非法实体根本无法存在
     def __post_init__(self) -> None:
+        # .shape 是 NumPy 数组的形状属性，返回元组
+        # 一维 512 长度向量的 shape 是 (512,)，注意逗号——Python 单元素元组写法
         if self.vector.shape != (_EMBED_DIM,):
+            # f-string 是 Python 3.6+ 的字符串格式化语法
+            # f"...{expr}..." 中 {expr} 会被求值后插入字符串
             raise ValueError(
                 f"FaceEncoding 必须是 ({_EMBED_DIM},) 维，收到 {self.vector.shape}"
             )
+        # np.linalg.norm 默认计算 L2 范数（向量长度）
+        # float(...) 把 NumPy 标量转 Python 原生 float
+        #   - 避免后续 JSON 序列化、日志打印等场景遇到 numpy 类型的小麻烦
         norm = float(np.linalg.norm(self.vector))
         if abs(norm - 1.0) > _NORM_TOLERANCE:
+            # {norm:.4f} 是格式化指令——保留 4 位小数
             raise ValueError(f"FaceEncoding 必须 L2 归一化（||v||=1），当前 ||v||={norm:.4f}")
 
+    # other 参数类型注解写成 "FaceEncoding"（带引号）的字符串
+    # 因为定义到这里时 FaceEncoding 这个名字还没"完全建好"，直接用会报错
+    # 用引号叫"前向引用（forward reference）"，Python 会延迟解析
     def cosine_similarity(self, other: "FaceEncoding") -> float:
+        """计算与另一个 FaceEncoding 的余弦相似度。
+
+        因为两个向量都已 L2 归一化，余弦相似度等价于它们的点积——
+        无需再除以范数（都是 1），省一步且更稳。
+        """
+        # np.dot 在两个一维数组上 = 它们的内积/点积 = sum(a[i] * b[i])
+        # 内积公式 vs 余弦相似度：cos = (a·b) / (||a||·||b||)
+        # 因为 ||a||=||b||=1，所以 cos = a·b（点积）
         return float(np.dot(self.vector, other.vector))
 
 
+# ===== Template：单条模板向量 =====
+# 一个 Person 可能有 1~50 条 Template，取决于使用的策略：
+#   - random_one / mean_all 策略：1 条
+#   - manual_three / kmeans_k3：3 条
+#   - all_vectors：N 条（注册集所有照片）
 @dataclass(frozen=True)
 class Template:
+    """单条模板向量。识别时把库内所有 Template 凑成一个矩阵做暴力检索。"""
+
     encoding: FaceEncoding
-    source: str
+    source: str                 # 来源标识，如 "kmeans_centroid_0" / "raw_photo_3.jpg" / "mean"
     created_at: datetime
 
 
+# ===== Person：领域聚合根 =====
+# 在领域驱动设计（DDD）中，"聚合根"是访问一组相关实体的唯一入口
+# 这里 Person 是访问其下所有 Template 的入口——你不能在系统中独立地存一个无主 Template
 @dataclass(frozen=True)
 class Person:
-    person_id: str
-    display_name: str
+    """库内人员 = 唯一 ID + 名字 + 多个模板向量。"""
+
+    person_id: str              # 唯一 ID，本项目中直接用文件夹名（如 "alice"）
+    display_name: str           # 展示名，前端用
+    # tuple[Template, ...] 类型注解：含义是"任意长度的 Template 元组"
+    #   - 末尾的 ... 是 Ellipsis 字面量，表示"可变长"
+    #   - 用 tuple 而非 list：与 frozen=True 配合，让 Person 真正不可变
+    #     list 是可变容器（即使外层 frozen，list 内容仍可被偷偷改）
+    #     tuple 是不可变容器，外层加内层都不可变，消除一类 bug
     templates: tuple[Template, ...]
 
 
+# ===== RecognitionResult：识别用例的输出 =====
 @dataclass(frozen=True)
 class RecognitionResult:
+    """把识别决定 + 置信度 + 当时阈值打包返回。
+
+    为什么把 threshold 也放进结果里？
+    - 便于审计与日志：将来回看历史识别记录，能立即看出"当时用的阈值"
+    - 阈值会随着评估实验更新（spec §6 提到的 config.yaml 调整）
+    """
+
+    # str | None 是 PEP 604 联合类型语法（Python 3.10+ 支持）
+    #   - 等价于旧写法 Optional[str] 或 Union[str, None]
+    #   - None 表示未识别（库为空 / 最高相似度 < 阈值）
     person_id: str | None
-    similarity: float
-    threshold: float
+    similarity: float           # 与最匹配模板的相似度，[-1, 1]
+    threshold: float            # 当时使用的阈值
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -245,6 +392,7 @@ git commit -m "feat(domain): 加 FaceEncoding/Template/Person/RecognitionResult 
 ```python
 import pytest
 
+# 一次 import 多个名字时，把它们写在括号里换行，可读性更好
 from face_recognition.domain.errors import (
     FaceRecognitionError,
     NoFaceError,
@@ -258,15 +406,32 @@ from face_recognition.domain.errors import (
 
 
 def test_all_errors_inherit_base():
+    """所有具体异常都应继承自 FaceRecognitionError 基类。
+
+    为什么需要基类？API 层可以一次 try ... except FaceRecognitionError，
+    捕获我们项目所有领域异常，统一映射成 HTTP 4xx/5xx；
+    不会因为忘了某个具体异常而漏处理。
+    """
+    # 把所有具体异常类放到一个元组里，循环检查
+    # 元组比 list 更适合"固定不变的几个东西"——也是 Python 习惯
     for cls in (
         NoFaceError, MultipleFacesError, PersonNotFoundError,
         DuplicatePersonError, LowConfidenceError,
         PersonHasNoTemplatesError, CameraDisconnectedError,
     ):
+        # issubclass(child, parent) 检查 child 是不是 parent 的子类（包括孙子辈等）
+        # 注意：issubclass 接受类对象作参数；isinstance 接受实例对象
         assert issubclass(cls, FaceRecognitionError)
 
 
 def test_each_error_has_stable_code():
+    """每个异常类都应有稳定的 code 字符串属性。
+
+    为什么需要 code？将来前端要根据错误类型展示中文提示
+    （比如 NO_FACE → "未检测到人脸，请正对镜头"）。
+    类名可能改名重构，但 code 是稳定 API——前后端约定的"暗号"。
+    """
+    # 类属性可以直接用 ClassName.attr 访问，不需要先创建实例
     assert NoFaceError.code == "NO_FACE"
     assert MultipleFacesError.code == "MULTIPLE_FACES"
     assert PersonNotFoundError.code == "PERSON_NOT_FOUND"
@@ -277,11 +442,22 @@ def test_each_error_has_stable_code():
 
 
 def test_multiple_faces_carries_count():
+    """MultipleFacesError 应携带具体检出的人脸数量。
+
+    为什么需要 count？错误信息能更精确："检出 3 张脸（要求 1 张）"
+    比"检出多张脸"更有用——日志里能直接看出问题严重程度。
+    """
     err = MultipleFacesError(count=3)
+    # 实例属性用 instance.attr 访问
+    # 这里 count 是 MultipleFacesError 的实例属性（每个实例独立存储），
+    # 不是类属性（所有实例共享）
     assert err.count == 3
 
 
 def test_can_be_raised_and_caught_by_base():
+    """子类异常应能被基类的 except 块捕获——这是基类设计的核心目的。"""
+    # raise 关键字抛异常；NoFaceError(...) 创建异常实例
+    # except 子句捕获时按"是不是基类的实例"判断，所以子类抛出能被基类捕获
     with pytest.raises(FaceRecognitionError):
         raise NoFaceError("没检测到人脸")
 ```
@@ -295,39 +471,80 @@ uv run pytest tests/unit/test_errors.py -v
 - [ ] **Step 3: 实现 `src/face_recognition/domain/errors.py`**
 
 ```python
+# Python 的所有异常都继承自内置 Exception 类
+# 自定义异常的标准做法：写一个 class，继承 Exception 即可
+# 这是整个项目领域异常的"祖先"——任何业务错误都应通过它的子类抛出
 class FaceRecognitionError(Exception):
+    """所有领域异常的基类。
+
+    用法：
+        try:
+            ...
+        except FaceRecognitionError as e:
+            print(e.code)  # 给前端的稳定错误码
+    """
+
+    # 类属性（class attribute）：所有实例共享同一个 code
+    # 子类可以覆盖它（写 code = "NO_FACE" 等）
+    # 类型注解 `code: str = "..."` 表示"code 是 str 类型，默认值 ..."
     code: str = "FACE_RECOGNITION_ERROR"
 
 
+# class Child(Parent): 表示 Child 继承自 Parent
+# 子类自动获得父类的所有属性和方法（除非显式覆盖）
 class NoFaceError(FaceRecognitionError):
+    """图中未检测到人脸时抛出。"""
+
+    # 这里覆盖父类的 code 属性
+    # Python 的属性查找：先在子类找，找不到再去父类找——所以子类 code 会胜出
     code = "NO_FACE"
 
 
 class MultipleFacesError(FaceRecognitionError):
+    """图中检测到多张脸（注册/识别要求单脸）时抛出。"""
+
     code = "MULTIPLE_FACES"
 
+    # 显式定义 __init__ 接受额外参数 count
+    # 注意：父类 Exception 的 __init__ 接受 message 参数；这里我们想保留这能力 + 加 count
+    # message: str | None = None 是默认参数：调用时不传则为 None
     def __init__(self, count: int, message: str | None = None) -> None:
+        # super().__init__(...) 调用父类（Exception）的构造函数
+        # 'super()' 是 Python 引用父类的标准方式
+        # 传给它的 message 会成为异常的"消息"，用 str(err) 能打印出来
+        # 'message or f"..."' 是 Python 习惯：message 真值时用 message，否则用 fallback
+        #   - None / 空字符串 / 0 / False / 空列表都算"假值"
         super().__init__(message or f"检出 {count} 张脸（要求 1 张）")
+        # self.count 是实例属性，每个 MultipleFacesError 实例自己存一份
+        # 区别于上面的类属性 code（所有实例共享）
         self.count = count
 
 
+# 后续异常都是简单子类，只覆盖 code 即可——不需要额外字段或自定义 __init__
 class PersonNotFoundError(FaceRecognitionError):
+    """要查询/删除的 person_id 不在数据库时抛出。"""
     code = "PERSON_NOT_FOUND"
 
 
 class DuplicatePersonError(FaceRecognitionError):
+    """注册时 person_id 已存在（如要求"严格唯一"模式）时抛出。"""
     code = "DUPLICATE_PERSON"
 
 
 class LowConfidenceError(FaceRecognitionError):
+    """识别相似度低于阈值时使用——通常不抛而是返回 RecognitionResult(person_id=None)。
+    保留这个异常类型给将来如有"必须强匹配"的场景用。
+    """
     code = "LOW_CONFIDENCE"
 
 
 class PersonHasNoTemplatesError(FaceRecognitionError):
+    """注册某人时所有照片都识别失败、一个模板都没生成的情况。"""
     code = "NO_TEMPLATES"
 
 
 class CameraDisconnectedError(FaceRecognitionError):
+    """实时识别中摄像头中途断开。M4 阶段才会真正抛出，这里先定义好。"""
     code = "CAMERA_LOST"
 ```
 
