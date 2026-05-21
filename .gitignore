@@ -1,0 +1,82 @@
+# ============== Python ==============
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ============== 虚拟环境 ==============
+.venv/
+venv/
+env/
+ENV/
+
+# ============== uv / pip ==============
+.python-version-local
+pip-wheel-metadata/
+
+# ============== 测试 / 类型检查缓存 ==============
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ============== 项目数据（私人数据，绝不入仓）==============
+data/private_dataset/
+data/lfw_subset/
+data/lfw_raw/
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+logs/*
+!logs/.gitkeep
+*.log
+
+# ============== 模型权重（按需下载到 ~/.insightface/，不入仓）==============
+*.onnx
+*.pth
+*.pt
+*.bin
+models/
+checkpoints/
+
+# ============== 评估输出（每次跑会重生成）==============
+evaluation/reports/*.png
+evaluation/reports/*.csv
+evaluation/reports/*.html
+evaluation/reports/*.md
+!evaluation/reports/.gitkeep
+
+# ============== 本地配置覆盖 ==============
+config.local.yaml
+.env
+.env.local
+
+# ============== 不公开的本地文件 ==============
+# CLAUDE.md 是给 AI 协作者看的，不入公共仓库
+CLAUDE.md
+# LICENSE 由 GitHub 远程仓库提供（内容相同），本地保留但不重复入仓
+LICENSE
+
+# ============== IDE / 编辑器 ==============
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ============== Jupyter ==============
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ============== 构建产物 ==============
+build/
+dist/
+*.egg-info/
+*.egg

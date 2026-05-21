@@ -1,0 +1,92 @@
+# ============================================================
+# 项目配置文件
+# ------------------------------------------------------------
+# 所有可调参数集中在这里，禁止在代码中硬编码这些值。
+# 改阈值、换 GPU、调跟踪窗口都改这里，不动代码。
+#
+# 加载机制：用 pydantic-settings 读取并做类型校验，
+# 配置错误启动时立即报错，不留运行时雷。
+#
+# 本地覆盖：如需本地开发覆盖某些字段（比如改路径），
+# 复制为 config.local.yaml（已在 .gitignore），优先级更高。
+# ============================================================
+
+model:
+  # InsightFace 的模型组合包名。buffalo_l = ResNet100 ArcFace + SCRFD。
+  # CPU 实验可换成 buffalo_s（MobileFaceNet），但准确率会降。
+  pack: "buffalo_l"
+
+  # GPU 卡号；-1 表示用 CPU。多卡机器可改成 1 / 2。
+  ctx_id: 0
+
+  # SCRFD 检测器的输入尺寸。640x640 是默认平衡点。
+  # 减小（如 320）速度更快但小脸检测变差；增大（如 960）反之。
+  det_size: [640, 640]
+
+recognition:
+  # 识别阈值（余弦相似度，[-1, 1] 范围）。
+  # ⚠️ 占位值 0.45，**评估实验跑完后会被替换为最优工作点**（EER 或 TAR@FAR=1e-3 对应的相似度）。
+  threshold: 0.45
+
+  # 部署时使用的模板生成策略，5 选 1：
+  #   random_one    | 随机选 1 张照片
+  #   mean_all      | 全部照片取平均
+  #   manual_three  | 人工挑 3 张（需手动标注）
+  #   kmeans_k3     | K-means 聚 3 簇取质心
+  #   all_vectors   | 全部照片直接存
+  template_strategy: "kmeans_k3"
+
+camera:
+  # OpenCV VideoCapture 的设备索引。0 是默认摄像头，外接 USB 摄像头通常是 1。
+  device_index: 0
+
+  # 采集分辨率。1280x720 在大多数笔记本摄像头上是质量与速度的平衡点。
+  resolution: [1280, 720]
+
+  # 目标采集帧率。实际帧率由摄像头硬件决定，这里只是请求值。
+  fps: 30
+
+realtime:
+  # 检测频率：1 = 每帧都检测；2 = 隔帧检测（省算力但跟踪更易丢）。
+  detect_every_n_frames: 1
+
+  # 新跟踪框出现时是否立即跑识别。关闭可避免短暂晃过的人脸触发识别。
+  recognize_on_new_track: true
+
+  # IoU 跟踪阈值：前后帧人脸框的 IoU > 这个值才认为是同一个人。
+  iou_threshold: 0.5
+
+  # 跟踪框消失多少帧才丢弃身份。值越大越能容忍短暂遮挡 / 视野丢失。
+  # 30 FPS 下 15 帧 ≈ 0.5 秒。
+  track_max_missing_frames: 15
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+data:
+  # SQLite 数据库文件路径。注册的人员模板存这里。
+  sqlite_path: "data/face.db"
+
+  # 私有数据集根目录。按文件夹分人，每个子文件夹名即 person_id。
+  dataset_root: "data/private_dataset"
+
+  # LFW 抽样的库外陌生人集合（评估用）。
+  lfw_subset: "data/lfw_subset"
+
+evaluation:
+  # 数据切分随机种子。固定为 42 保证可复现，**勿改**（除非要做随机种子敏感性分析）。
+  random_seed: 42
+
+  # 训练 / 测试切分比例。0.8 表示 80% 注册、20% 测试。
+  train_ratio: 0.8
+
+  # ROC 报告的目标 FAR 列表。每个值会输出 TAR@FAR=x。
+  far_targets: [0.001, 0.01, 0.1]
+
+logging:
+  # 日志级别：DEBUG / INFO / WARNING / ERROR。
+  level: "INFO"
+
+  # 日志文件路径。空字符串表示只输出到 stderr。
+  file: "logs/face.log"
