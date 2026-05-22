@@ -8,6 +8,10 @@
 
 **Tech Stack:** FastAPI（HTTP + WebSocket）、uvicorn、OpenCV `VideoCapture`、threading（采集）、asyncio（推流）、numpy（矩阵乘法检索）、starlette StaticFiles（托管前端）、pytest + httpx + TestClient。
 
+> **预备工作（Prerequisite）**：动手 Task 0 之前先确认 `pyproject.toml` 的 `dependencies` 里有 `python-multipart>=0.0.9`。FastAPI 的 `Form()` / `File()` 装饰器**只要装饰一个路由就会在导入时立刻 `RuntimeError: Form data requires "python-multipart" to be installed"`**——M1 不需要它，所以 M1 写完时这条很可能漏。如果没有，先 `uv add python-multipart`。
+
+> **macOS / 无 GPU 兼容性提醒**：`onnxruntime` 启动时会打 `UserWarning: Specified provider 'CUDAExecutionProvider' is not in available provider names`，这是**良性警告**——InsightFace 默认请求 CUDA，找不到就回落到 CoreML / CPU。**不要为了消除这条 warning 改 M1 代码**。
+
 ---
 
 ## 任务清单（14 个）
@@ -1347,6 +1351,15 @@ def get_pipeline() -> FacePipeline:
     """加载 InsightFace 模型一次。@lru_cache 保证全应用单例。
 
     构造参数对齐 M1：model_pack（不是 model_name）+ ctx_id（GPU/CPU 选择）+ det_size。
+
+    ⚠️ **首次启动会下载 buffalo_l 权重 ~250MB**，存到 `~/.insightface/models/`，
+    后续启动只读本地缓存。**模型加载本身耗 ~10s（CPU/CoreML）或 ~3s（GPU）**——
+    `lifespan` 启动时同步等它跑完，期间 uvicorn 不会接受请求，正常现象。
+
+    💡 **lazy import 约束**：M1 的 `InsightFacePipeline.__init__` 里 `from insightface.app
+    import FaceAnalysis` 必须放在 `__init__` 函数体内（不能放模块顶部）——否则一 `import
+    dependencies` 就触发 InsightFace 全局初始化，单元测试 collect 阶段（不该加载模型）会
+    挂十几秒甚至失败。本项目 M1 已遵守这条，但你看代码时会奇怪为什么 import 不在顶部。
     """
     cfg = get_config()
     return InsightFacePipeline(
@@ -1361,6 +1374,12 @@ def get_repository() -> PersonRepository:
     """SQLite 仓储单例。
 
     M1 的 SqliteRepository 接受 db_path: Path | str，从 cfg.data.sqlite_path 取。
+
+    ⚠️ **多线程硬性要求**：M1 的 `SqliteRepository.__init__` 内 `sqlite3.connect(...)`
+    必须传 `check_same_thread=False`。FastAPI 在 worker 线程里跑路由处理，但 lifespan
+    在主线程构造 repo——共享 connection 会抛 `sqlite3.ProgrammingError: SQLite objects
+    created in a thread can only be used in that same thread`。如果 M1 没加这个参数，
+    回去补；本项目用一个全局连接 + numpy 暴力检索，不存在并发写冲突，关闭线程检查安全。
     """
     cfg = get_config()
     return SqliteRepository(cfg.data.sqlite_path)
@@ -1826,16 +1845,34 @@ def test_register_person_unknown_strategy_returns_400(client_with_data):
 # 放进 @pytest.mark.integration 标记里，CI 上跳过，本地手动跑。
 @pytest.mark.integration
 def test_register_person_happy_path(client_with_data):
-    """真实流程冒烟：上传 1 张 InsightFace sample 图，注册成功。
+    """真实流程冒烟：上传 1 张单脸图，注册成功。
 
     @pytest.mark.integration 是自定义标记（在 pyproject.toml 的 pytest 配置里声明），
     `pytest -m integration` 才跑这个测试，默认 `pytest` 跳过。
+
+    ⚠️ **样本图陷阱**：InsightFace 内置的 `t1.jpg` 是 6 人合照，直接喂给注册会触发
+    `MultipleFacesError`（注册要求**正好 1 张脸**）。这里我们先用 pipeline 检测出第一张
+    脸，按 bbox 裁出单脸子图再上传，才能走 happy-path。
     """
     import insightface
+    import cv2
     from pathlib import Path
+    from face_recognition.api.dependencies import get_pipeline
+
     sample_dir = Path(insightface.__file__).parent / "data" / "images"
-    sample_jpg = sample_dir / "t1.jpg"  # InsightFace 内置示例图，含人脸
-    files = [("images", ("t1.jpg", sample_jpg.read_bytes(), "image/jpeg"))]
+    sample_jpg = sample_dir / "t1.jpg"  # InsightFace 内置示例图，含 6 张脸
+
+    # 用 pipeline 找出第一张脸的 bbox，裁出单脸子图，再 JPEG 编码上传
+    img = cv2.imread(str(sample_jpg))
+    faces = get_pipeline().detect(img)  # detect 返回 list[DetectedFace]，含 bbox
+    assert len(faces) >= 1, "测试样本图应能检出至少 1 张脸"
+    x1, y1, x2, y2 = faces[0].bbox
+    crop = img[y1:y2, x1:x2]
+    ok, buf = cv2.imencode(".jpg", crop)
+    assert ok
+    single_face_bytes = buf.tobytes()
+
+    files = [("images", ("face.jpg", single_face_bytes, "image/jpeg"))]
     response = client_with_data.post(
         "/api/persons",
         data={"person_id": "testuser", "display_name": "TestUser", "strategy": "random_one"},
@@ -2721,11 +2758,26 @@ from face_recognition.infrastructure.sqlite_repository import SqliteRepository
 
 @pytest.mark.integration
 def test_register_list_delete_e2e(tmp_path):
-    """完整生命周期:注册 → 列表 → 模板查询 → 删除 → 列表为空。"""
+    """完整生命周期:注册 → 列表 → 模板查询 → 删除 → 列表为空。
+
+    ⚠️ **样本图陷阱**：InsightFace 的 `t1.jpg` 是 6 人合照，注册要求**正好 1 张脸**，
+    直接上传会 400。先用 pipeline 检测裁出第一张脸的子图再上传。
+    """
+    import cv2
+    from face_recognition.api.dependencies import get_pipeline
+
     repo = SqliteRepository(tmp_path / "e2e.db")
     app.dependency_overrides[get_repository] = lambda: repo
 
     sample_jpg = Path(insightface.__file__).parent / "data" / "images" / "t1.jpg"
+    img = cv2.imread(str(sample_jpg))
+    faces = get_pipeline().detect(img)
+    assert len(faces) >= 1
+    x1, y1, x2, y2 = faces[0].bbox
+    crop = img[y1:y2, x1:x2]
+    ok, buf = cv2.imencode(".jpg", crop)
+    assert ok
+    single_face_bytes = buf.tobytes()
 
     # 用 try/finally 确保即使中间 assert 失败也能清理 overrides。
     # 否则失败会把 repo 泄漏到后续测试,造成"看似无关"的连锁失败。
@@ -2734,13 +2786,12 @@ def test_register_list_delete_e2e(tmp_path):
             # 1. 初始为空
             assert client.get("/api/persons").json() == []
 
-            # 2. 注册
-            with sample_jpg.open("rb") as f:
-                response = client.post(
-                    "/api/persons",
-                    data={"person_id": "e2e", "display_name": "E2E", "strategy": "random_one"},
-                    files={"images": ("t1.jpg", f, "image/jpeg")},
-                )
+            # 2. 注册（用裁好的单脸子图）
+            response = client.post(
+                "/api/persons",
+                data={"person_id": "e2e", "display_name": "E2E", "strategy": "random_one"},
+                files={"images": ("face.jpg", single_face_bytes, "image/jpeg")},
+            )
             assert response.status_code == 201
             person_id = response.json()["person_id"]
             assert person_id == "e2e"
