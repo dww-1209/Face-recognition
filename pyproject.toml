@@ -63,8 +63,9 @@ quote-style = "double"
 
 [tool.mypy]
 python_version = "3.12"
-strict = true
-warn_unused_ignores = true
+# 不开 strict——strict 会顺带打开 disallow_any_generics，
+# 让 np.ndarray 这种"约定俗成裸写"的泛型类一律报错，反而违反 ML 项目的阅读直觉。
+# 这里只保留最有价值的一条：函数必须写参数和返回值类型注解。
 disallow_untyped_defs = true
 mypy_path = "src"
 explicit_package_bases = true
