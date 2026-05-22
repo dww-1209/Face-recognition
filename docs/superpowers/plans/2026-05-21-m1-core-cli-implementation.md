@@ -104,10 +104,22 @@ import numpy as np
 import pytest
 
 # datetime 用来给 Template 加"创建时间"字段
-from datetime import datetime
+from datetime import datetime, timezone
 
 # 从我们要实现的模块里导入 4 个实体类
-# 注意：这一行会失败（因为 entities.py 还是空的）——这正是 TDD"先写失败测试"的重点
+# 注意：这一行会失败（因为 entities.py 还是空的）——这正是 TDD"先写失败测试"的重点。
+#
+# ── 给小白解释这条 import 路径 ──
+# 为什么是 `face_recognition.domain.entities` 而不是 `src.face_recognition.domain.entities`
+# 也不是相对路径 `from .entities import ...`？
+#   1) 项目用的是 **src layout**：源码全部放在 `src/face_recognition/` 下，根目录只放
+#      pyproject.toml / tests / docs。pyproject.toml 里 `[tool.hatch.build.targets.wheel]
+#      packages = ["src/face_recognition"]` 告诉打包工具"src/ 下面的 face_recognition
+#      是真正的包名"——`src/` 这一层在 import 路径里**不出现**。
+#   2) `uv sync` 会以 editable 模式把项目装进虚拟环境，所以 `face_recognition` 就和
+#      安装的 numpy 一样可以用绝对路径 import；测试不在包内，用相对 import 反而出错。
+#   3) src layout 的好处：在项目根跑 `python -c "import face_recognition"` 一定走的是
+#      安装版而非误走当前目录里的同名 py 文件——避免"测试通过但发布到别的环境就崩"。
 from face_recognition.domain.entities import (
     FaceEncoding,
     Template,
@@ -242,7 +254,7 @@ uv run pytest tests/unit/test_entities.py -v
 from dataclasses import dataclass
 
 # datetime 类型用于 Template.created_at 字段
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -250,6 +262,17 @@ import numpy as np
 # 下划线开头是 Python 约定的"私有"标志，不会被 from xxx import * 导出
 _EMBED_DIM = 512                # ArcFace ResNet100 输出向量维度，buffalo_l 模型固定为 512
 _NORM_TOLERANCE = 1e-3          # L2 范数容忍度：理论 ||v||=1，浮点实际可能是 0.9999~1.0001 都接受
+# ── 给小白解释这个数 1e-3 ──
+#   Q1: 为什么是 1e-3 (= 0.001)？
+#       float32 的相对精度大约 1e-7；一次 L2 归一化 + SQLite BLOB 序列化往返 + 余弦点积，
+#       误差累积大约在 1e-4 量级。1e-3 比累积误差大一个数量级——给足"安全边距"，
+#       不会因正常浮点抖动而误判向量"没归一化"。
+#   Q2: 为什么不用 1e-6 或 1e-9？
+#       太严了。1e-6 比累积误差还小，会出现"理论上该过、实际偶尔抛 InvalidEncodingError"
+#       的玄学失败，调试起来非常痛苦。
+#   Q3: 为什么不用 1e-1？
+#       太松。L2 范数 0.9 还能过容忍——但 0.9 不是单位球面，余弦点积就不再等价于余弦
+#       相似度，下游所有阈值都失效。1e-3 是"够松到不抖、够严到不掩盖真 bug"的折中。
 
 
 # ===== FaceEncoding：领域层最核心的实体 =====
@@ -546,6 +569,14 @@ class PersonHasNoTemplatesError(FaceRecognitionError):
 class CameraDisconnectedError(FaceRecognitionError):
     """实时识别中摄像头中途断开。M4 阶段才会真正抛出，这里先定义好。"""
     code = "CAMERA_LOST"
+
+
+class EncodingError(FaceRecognitionError):
+    """编码异常:模型输出零向量、L2 归一化分母为 0 等"模型本身坏了"的情况。
+
+    与 NoFaceError(图里就没脸)区分:NoFaceError 是输入数据问题,EncodingError 是模型问题。
+    """
+    code = "ENCODING_ERROR"
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -580,6 +611,26 @@ git commit -m "feat(domain): 加领域异常层次（NoFace/MultipleFaces/Person
 #   - 好处：domain 层不需要 import infrastructure（避免反向依赖），
 #          只要 SqliteRepository 定义了 add/get/... 方法签名匹配，类型检查就过
 #   - 对比 abc.ABC：ABC 强制继承，会让 domain 反向依赖到具体实现位置
+#
+# ── 给小白：3 行最小对比例子 ──
+#   # 传统 ABC（必须显式继承才算实现）：
+#   class Animal(ABC):
+#       @abstractmethod
+#       def speak(self) -> str: ...
+#   class Dog(Animal):           # ← 必须写 (Animal)
+#       def speak(self) -> str: return "汪"
+#
+#   # Protocol（只要方法名 + 签名一致就算）：
+#   class Speaker(Protocol):
+#       def speak(self) -> str: ...
+#   class Dog:                    # ← 不写继承
+#       def speak(self) -> str: return "汪"
+#   def call(s: Speaker) -> str: return s.speak()
+#   call(Dog())                   # ← 类型检查通过：Dog 长得像 Speaker
+#
+# 关键差异：用 Protocol 时 Dog 自己**完全不知道** Speaker 存在；用 ABC 时 Dog
+# 必须 import Animal 才能继承。本项目 SqliteRepository 不需要 import domain 的
+# Protocol——它只要把方法名/签名实现对就行——这正是清洁架构"依赖反转"的体现。
 from typing import Protocol
 
 import numpy as np
@@ -595,6 +646,11 @@ from face_recognition.domain.entities import (
 
 
 class FacePipeline(Protocol):
+    # 模型版本字符串(如 "buffalo_l")。下游评估管线把它作为 FaceEncoding.model_version 写入,
+    # 避免在评估代码里硬编码字符串——换模型时只在 InsightFacePipeline 构造处改一处。
+    # 用属性而非方法:配置一次,运行期不变;Protocol 里写成裸属性即可。
+    model_version: str
+
     # 方法体只写 ... （三个点，叫 Ellipsis 字面量），表示"什么都不做的占位"。
     #   - 在 Protocol 里，方法体不会被执行，只用来声明签名
     #   - 也可以写 pass，但 ... 是 Protocol/Stub 的社区惯例
@@ -689,7 +745,7 @@ git commit -m "feat(domain): 加 FacePipeline/PersonRepository/TemplateStrategy 
 #   - Callable[[ArgType], ReturnType] 表示"接收 ArgType、返回 ReturnType 的函数"
 #   - Python 3.9 之前要从 typing 导，3.9+ 推荐 collections.abc（与运行时同源）
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -746,6 +802,16 @@ def make_template(make_encoding: Callable[[int], FaceEncoding]) -> Callable[[int
 #   - 路径形如 /private/var/folders/.../pytest-of-user/test_xxx0/
 #   - 测试结束后 pytest 默认保留最近 3 次（方便排查失败），更早的自动清理
 #   - 多个测试并行也不会冲突
+#
+# ── 给小白：fixture 注入是怎么发生的 ──
+# pytest 看到测试函数（或下面这个 fixture）的形参里出现了 `tmp_path`，就**按形参名
+# 查找** 同名的 fixture，把它的返回值塞进来。所以：
+#   - 形参名必须是 `tmp_path` 一字不差。写成 `tmp_pth` / `tmppath` / `tmp_dir`
+#     都不会注入——pytest 找不到匹配的 fixture，最终拿到的是普通的 None 或者直接抛
+#     "fixture not found" 错。
+#   - 不要在函数体里手动 `tmp_path = something`——那会盖掉注入的值。
+#   - 类型注解 `: Path` 是给 IDE 和 mypy 看的，对 pytest 注入机制没影响（pytest 只
+#     看名字）。但写上类型对自己最有好处：自动补全 `tmp_path.read_text()` 之类的方法。
 @pytest.fixture
 def tmp_db_path(tmp_path: Path) -> Path:
     # 在临时目录里凑一个 .db 路径返回。注意这里只是**路径**，
@@ -943,6 +1009,9 @@ class RealtimeConfig(BaseModel):
     recognize_on_new_track: bool
     iou_threshold: float = Field(ge=0.0, le=1.0)  # IoU 数学上 [0, 1]
     track_max_missing_frames: int = Field(ge=0)
+    # JPEG 编码质量,1=最差/最小,100=最佳/最大。85 是肉眼无损临界值,
+    # 兼顾画质和 WebSocket 带宽(640×480 约 30~60KB/帧)。
+    jpeg_quality: int = Field(85, ge=1, le=100)
 
 
 class ApiConfig(BaseModel):
@@ -1174,6 +1243,39 @@ def test_empty_matrix_is_zero_rows(tmp_db_path: Path):
     matrix, ids = repo.all_templates_matrix()
     assert matrix.shape == (0, 512)
     assert ids == []
+
+
+def test_concurrent_reads_do_not_raise(
+    tmp_db_path: Path,
+    make_template: Callable[..., Template],
+):
+    """多线程并发调用同一个 repo 不应崩溃。
+
+    M4 的 FastAPI 在线程池里跑同步代码——如果 SqliteRepository 没设
+    check_same_thread=False 或没加锁,这里会抛 sqlite3.ProgrammingError。
+    """
+    import threading  # 测试内部 import,避免污染模块顶部
+
+    repo = SqliteRepository(tmp_db_path)
+    repo.add(Person(person_id="alice", display_name="Alice", templates=(make_template(),)))
+
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            for _ in range(50):
+                repo.get("alice")
+                repo.all_templates_matrix()
+        except BaseException as e:  # noqa: BLE001 - 测试要捕所有异常
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"并发访问出错: {errors}"
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1190,7 +1292,8 @@ uv run pytest tests/unit/test_sqlite_repository.py -v
 #   - 35 人 × 几个模板 = 几百行数据，SQLite 完全够用
 #   - 选 SQLite 而非 PostgreSQL/MySQL：零配置、无服务器、和项目同生命周期
 import sqlite3
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -1238,18 +1341,48 @@ class SqliteRepository:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         # sqlite3.connect(path)：打开（或创建）一个 SQLite 数据库连接。
         # 文件不存在会自动创建。返回 Connection 对象，后续所有操作走它。
-        self._conn = sqlite3.connect(self._db_path)
+        #
+        # check_same_thread=False 是关键 —— Python 的 sqlite3 模块默认要求
+        # "创建 connection 的线程才能用它"。M4 的 FastAPI / WebSocket 会在线
+        # 程池里跑同步代码（CLI 用例被 `run_in_threadpool` 调度），如果不关掉
+        # 这个检查就会抛 "SQLite objects created in a thread can only be used
+        # in that same thread"。
+        #
+        # 关掉检查后必须自己加锁——SQLite 的 connection 本身**不是**线程安全
+        # 的。下面的 self._lock 保证同一时刻只有一个线程在操作 connection。
+        # 35 人量级的项目里这把锁完全不构成性能瓶颈。
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._lock = threading.Lock()
         # PRAGMA foreign_keys = ON：SQLite 默认**不**强制外键，必须显式打开。
         # 不开的话上面定义的 FOREIGN KEY 形同虚设，删人时不会级联删模板。
         self._conn.execute("PRAGMA foreign_keys = ON")
         # executescript 可以一次跑多条 SQL（用 ; 分隔）。execute 一次只能一条。
         self._conn.executescript(_SCHEMA)
+        # ── 给小白：整套并发设计的几个常见疑问 ──
+        # Q1: 为什么不每次操作都 `with sqlite3.connect(...)` 临时新建一个 connection？
+        #     一个 connect 大约要 1~3ms（解析 db 文件头 + 建立 page cache）。M4 实时
+        #     识别每帧都要 `query()` 查模板矩阵，每秒 30 帧 × 3ms = 90ms 纯开销，CPU
+        #     白白吃掉 9%。维持长连接 + Lock 串行化，连接开销摊到 0。
+        # Q2: 为什么用普通 Lock 而不是 RLock（可重入锁）？
+        #     普通 Lock 不可重入：同一线程二次 `with self._lock:` 会自我死锁。但本类
+        #     的方法之间**互不调用**——`add` 不会调 `get`、`get` 不会调 `list_all`，所以
+        #     不会出现"嵌套加锁"的情况。普通 Lock 比 RLock 快一点（少一次重入计数）。
+        #     例外：`list_all` 内部刻意把"取数据"和"还原对象"拆成两段，前段在锁内拿
+        #     到 rows 后**释放锁**，后段不持锁地构造 Person——见下方 list_all 注释。
+        # Q3: 为什么不用每个请求一个 connection（FastAPI 依赖注入风格）？
+        #     可以但更复杂：要写 contextmanager + 依赖注入，且 SQLite WAL 模式才支持
+        #     多 connection 高并发。本项目并发量小（35 人门禁场景峰值 5 QPS），单
+        #     connection + 锁是更直白、更易讲清楚的方案。
+        # Q4: check_same_thread=False 不加锁直接用会怎样？
+        #     SQLite 的 connection 内部有 prepared statement 缓存，多线程同时操作会
+        #     破坏这个缓存，出现段错误（C 层崩溃）或脏数据。Python 层可能不报错只
+        #     返回错乱结果——这种 bug 极难复现，所以"关检查"和"加锁"必须配套。
 
     def add(self, person: Person) -> None:
-        # `with self._conn:` 用 Connection 当上下文管理器 → 自动开启事务，
-        # 退出时如果没异常就 COMMIT，有异常就 ROLLBACK。
+        # `with self._lock:` 串行化所有 connection 操作；`with self._conn:`
+        # 在锁内开启 SQLite 事务（无异常 COMMIT，有异常 ROLLBACK）。
         # 保证"删旧 + 插新 + 插模板"要么全成功，要么全回滚（原子性）。
-        with self._conn:
+        with self._lock, self._conn:
             # 先 DELETE 再 INSERT，实现"重复 add 等价于覆盖"。
             # 配合外键级联，老模板会自动被删，不留垃圾数据。
             # 参数化查询：?  占位符 + 元组传值。**永远不要**用 f-string 拼 SQL，
@@ -1284,20 +1417,21 @@ class SqliteRepository:
                 )
 
     def get(self, person_id: str) -> Person | None:
-        # execute() 返回 Cursor；.fetchone() 取下一行（没有则 None）；
-        # .fetchall() 取所有剩余行；不调直接迭代 cursor 是流式取。
-        row = self._conn.execute(
-            "SELECT display_name FROM persons WHERE person_id = ?", (person_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        # 行结果是 tuple，按 SELECT 字段顺序索引
-        display_name = row[0]
-        tpl_rows = self._conn.execute(
-            "SELECT vector, source, model_version, created_at FROM templates "
-            "WHERE person_id = ? ORDER BY template_idx",  # 按 idx 排序还原插入顺序
-            (person_id,),
-        ).fetchall()
+        with self._lock:
+            # execute() 返回 Cursor；.fetchone() 取下一行（没有则 None）；
+            # .fetchall() 取所有剩余行；不调直接迭代 cursor 是流式取。
+            row = self._conn.execute(
+                "SELECT display_name FROM persons WHERE person_id = ?", (person_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            # 行结果是 tuple，按 SELECT 字段顺序索引
+            display_name = row[0]
+            tpl_rows = self._conn.execute(
+                "SELECT vector, source, model_version, created_at FROM templates "
+                "WHERE person_id = ? ORDER BY template_idx",  # 按 idx 排序还原插入顺序
+                (person_id,),
+            ).fetchall()
         # 生成器表达式 + tuple() 包裹 = 直接造 tuple，不建中间 list。
         # 写法 (expr for x in iter) 用圆括号；和列表推导式 [expr for x in iter] 区别仅此。
         templates = tuple(
@@ -1305,6 +1439,12 @@ class SqliteRepository:
                 encoding=FaceEncoding(
                     # np.frombuffer(bytes, dtype) = 把字节序列**零拷贝**解读成 ndarray。
                     # 比 np.array(list(bytes)) 快几十倍——直接共享内存视图。
+                    # ── dtype 必须严格匹配存进去时用的类型 ──
+                    # 存的时候 `vector.astype(np.float32).tobytes()` 写入 512×4=2048 字节；
+                    # 读的时候若误写 dtype=np.float64（每数 8 字节），frombuffer 会把
+                    # 2 个 float32 当作 1 个 float64 解释，得到 256 个垃圾 float——余弦
+                    # 点积出来的结果完全无意义、但程序**不会报错**。这是新手最容易踩的
+                    # 静默大坑，写错 dtype 就只能靠"识别准确率诡异低"反推。
                     vector=np.frombuffer(blob, dtype=np.float32),
                     model_version=mv,
                 ),
@@ -1319,7 +1459,7 @@ class SqliteRepository:
         return Person(person_id=person_id, display_name=display_name, templates=templates)
 
     def remove(self, person_id: str) -> None:
-        with self._conn:
+        with self._lock, self._conn:
             cur = self._conn.execute(
                 "DELETE FROM persons WHERE person_id = ?", (person_id,)
             )
@@ -1329,24 +1469,27 @@ class SqliteRepository:
                 raise PersonNotFoundError(person_id)
 
     def list_all(self) -> list[Person]:
-        # 直接迭代 cursor（不调 fetchall）= 流式遍历，省内存。
-        # 但这里数据量小，效果差不多。
-        ids = [
-            row[0]
-            for row in self._conn.execute(
-                "SELECT person_id FROM persons ORDER BY person_id"
-            )
-        ]
+        # 先在锁内取所有 id（短事务），再逐个 self.get(pid) —— 注意 get() 内部
+        # 自己也会拿锁，所以这里**不要**把外层 with self._lock 包住整个方法，
+        # 否则同一线程重入就会死锁（threading.Lock 不可重入）。
+        with self._lock:
+            ids = [
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT person_id FROM persons ORDER BY person_id"
+                )
+            ]
         # 列表推导带 if 过滤：[expr for x in iter if cond]
         # 这里其实 self.get(pid) 不会返回 None（因为 pid 来自 persons 表本身），
         # 但加一道 None 过滤让类型检查器闭嘴（mypy 不知道这个不变量）。
         return [p for p in (self.get(pid) for pid in ids) if p is not None]
 
     def all_templates_matrix(self) -> tuple[np.ndarray, list[str]]:
-        rows = self._conn.execute(
-            "SELECT person_id, vector FROM templates "
-            "ORDER BY person_id, template_idx"  # 双重排序保证矩阵行顺序确定
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT person_id, vector FROM templates "
+                "ORDER BY person_id, template_idx"  # 双重排序保证矩阵行顺序确定
+            ).fetchall()
         # 空库的特判：返回形状 (0, 512) 的"空矩阵"。
         # 为什么不直接返回 None？让调用端少写 if：
         #   matrix @ query 在 (0, 512) 上是合法的，得到长度为 0 的相似度数组，argmax 自然报错——
@@ -1364,13 +1507,19 @@ class SqliteRepository:
         return matrix, ids
 ```
 
+> **为什么不每次方法新开一条 connection？**
+> 那也是合法做法，但每次 `sqlite3.connect()` 都要重新解析文件、重放 WAL、
+> 加载 schema 缓存——M4 实时识别每帧都要查矩阵，这开销不可忽略。本项目数据
+> 量小、QPS 低，**一条共享连接 + Lock** 是最简且性能最好的折中。生产服务
+> 才需要 connection pool。
+
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
 uv run pytest tests/unit/test_sqlite_repository.py -v
 ```
 
-预期：8 passed
+预期：9 passed
 
 - [ ] **Step 5: commit**
 
@@ -1473,6 +1622,15 @@ def test_kmeans_k3_with_fewer_than_3_falls_back(make_encoding):
     assert len(out) == 2
 
 
+def test_manual_three_with_fewer_than_3_returns_what_it_has(make_encoding):
+    """manual_three 用 encodings[:3] 宽容切片——只有 2 张就返回 2 张，不报错。
+    这是评估流水线里"某人照片不够"的兜底：不让 5 策略对照实验里 manual_three 一家独崩。"""
+    out = ManualThreeStrategy().build([make_encoding(0), make_encoding(1)])
+    assert len(out) == 2
+    out_one = ManualThreeStrategy().build([make_encoding(0)])
+    assert len(out_one) == 1
+
+
 def test_all_vectors_returns_all_inputs(encs):
     out = AllVectorsStrategy().build(encs)
     assert len(out) == len(encs)
@@ -1509,7 +1667,7 @@ uv run pytest tests/unit/test_strategies.py -v
 #   - random.choice(seq) = 从序列里等概率挑一个
 #   - 这里**不用 np.random** 是因为：选 FaceEncoding 对象不是数值运算，标准库更轻量
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 
 from face_recognition.domain.entities import FaceEncoding, Template
 
@@ -1536,10 +1694,21 @@ class RandomOneStrategy:
             Template(
                 encoding=chosen,
                 source="random_one",
-                # datetime.utcnow() = 当前 UTC 时间（不带时区信息的 naive datetime）。
-                # 注：Python 3.12+ 已 deprecate utcnow()，推荐 datetime.now(timezone.utc)。
-                # 这里为保持简单，沿用 utcnow()；上线项目应换新写法。
-                created_at=datetime.utcnow(),
+                # 当前 UTC 时间。datetime.utcnow() 在 Python 3.12+ 已 deprecate;
+                # 现代写法是 datetime.now(timezone.utc) → 拿到 timezone-aware datetime,
+                # 再 .replace(tzinfo=None) 抹掉时区信息变 naive(SQLite 存储更省事)。
+                # 后续所有策略沿用本写法,保持时间字段一致。
+                # ── 给小白：为什么要 `.replace(tzinfo=None)` 这一步骚操作 ──
+                # Python 的 datetime 分两种：
+                #   - **naive**（无时区）：datetime(2026,1,1,12,0)，"几点几分"但不知道哪个时区
+                #   - **aware**（带时区）：datetime(2026,1,1,12,0, tzinfo=timezone.utc)
+                # 这两种**不能直接比较**，混着用 `dt1 < dt2` 会抛 TypeError。
+                # SQLite 的 TEXT 字段存 isoformat 字符串：aware 会写成
+                # "2026-01-01T12:00:00+00:00"，naive 写成 "2026-01-01T12:00:00"——
+                # 用 fromisoformat 读回来类型就跟着分裂。整套系统全用 naive UTC（先 now(utc)
+                # 拿到正确的 UTC 时刻，再 replace 抹掉 tzinfo）= 所有 datetime 都可比较，
+                # 也不会因为本地时区不同导致测试在不同机器上结果不一样。
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None),
             )
         ]
 ```
@@ -1548,7 +1717,7 @@ class RandomOneStrategy:
 
 ```python
 # src/face_recognition/application/strategies/mean_all.py
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -1589,7 +1758,7 @@ class MeanAllStrategy:
                     model_version=model_version,
                 ),
                 source="mean_all",
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(timezone.utc).replace(tzinfo=None),
             )
         ]
 ```
@@ -1598,7 +1767,7 @@ class MeanAllStrategy:
 
 ```python
 # src/face_recognition/application/strategies/manual_three.py
-from datetime import datetime
+from datetime import datetime, timezone
 
 from face_recognition.domain.entities import FaceEncoding, Template
 
@@ -1622,7 +1791,7 @@ class ManualThreeStrategy:
         chosen = encodings[:3]
         # 列表推导式：把每个原始 encoding 包成 Template，记录 source="manual_0/1/2"
         return [
-            Template(encoding=e, source=f"manual_{i}", created_at=datetime.utcnow())
+            Template(encoding=e, source=f"manual_{i}", created_at=datetime.now(timezone.utc).replace(tzinfo=None))
             for i, e in enumerate(chosen)
         ]
 ```
@@ -1631,7 +1800,7 @@ class ManualThreeStrategy:
 
 ```python
 # src/face_recognition/application/strategies/kmeans_k3.py
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 # sklearn (scikit-learn) = Python 最经典的传统机器学习库（聚类、回归、SVM、随机森林等）。
@@ -1668,7 +1837,7 @@ class KMeansK3Strategy:
                 Template(
                     encoding=e,
                     source=f"kmeans_fallback_{i}",
-                    created_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
                 for i, e in enumerate(encodings)
             ]
@@ -1697,7 +1866,7 @@ class KMeansK3Strategy:
                         model_version=model_version,
                     ),
                     source=f"kmeans_centroid_{i}",
-                    created_at=datetime.utcnow(),
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
             )
         return templates
@@ -1707,7 +1876,7 @@ class KMeansK3Strategy:
 
 ```python
 # src/face_recognition/application/strategies/all_vectors.py
-from datetime import datetime
+from datetime import datetime, timezone
 
 from face_recognition.domain.entities import FaceEncoding, Template
 
@@ -1727,7 +1896,7 @@ class AllVectorsStrategy:
         if not encodings:
             raise ValueError("AllVectorsStrategy 至少需要 1 个 encoding")
         return [
-            Template(encoding=e, source=f"all_{i}", created_at=datetime.utcnow())
+            Template(encoding=e, source=f"all_{i}", created_at=datetime.now(timezone.utc).replace(tzinfo=None))
             for i, e in enumerate(encodings)
         ]
 ```
@@ -1738,7 +1907,7 @@ class AllVectorsStrategy:
 uv run pytest tests/unit/test_strategies.py -v
 ```
 
-预期：9 passed
+预期：10 passed
 
 - [ ] **Step 9: commit**
 
@@ -1771,6 +1940,7 @@ import numpy as np
 import pytest
 
 from face_recognition.application.register_face import RegisterFace
+from face_recognition.application.strategies.all_vectors import AllVectorsStrategy
 from face_recognition.application.strategies.kmeans_k3 import KMeansK3Strategy
 from face_recognition.domain.entities import FaceEncoding, Person, Template
 from face_recognition.domain.errors import (
@@ -1864,7 +2034,7 @@ def test_skips_images_without_face(
     stub_repo: MagicMock,
     fake_image_loader,
 ):
-    """部分照片无脸 → warning 跳过，剩下的能成功就成功。"""
+    """部分照片无脸 → warning 跳过，剩下的能成功就成功；返回的 skipped 计数准确。"""
     person_dir = _make_person_dir(tmp_path, "alice", 5)
     pipeline = MagicMock()
     # side_effect 也可以传**列表**：第 i 次调用返回（或抛出）列表第 i 项。
@@ -1878,7 +2048,9 @@ def test_skips_images_without_face(
         strategy=KMeansK3Strategy(seed=42),
         image_loader=fake_image_loader,
     )
-    use_case.execute_for_person(person_dir)
+    n_ok, n_skip = use_case.execute_for_person(person_dir)
+    assert n_ok == 3
+    assert n_skip == 2
 
     person: Person = stub_repo.add.call_args.args[0]
     assert len(person.templates) == 3  # 3 张成功 → KMeans 3 簇
@@ -1934,6 +2106,40 @@ def test_execute_dir_skips_failed_people(
     assert summary.persons_failed == 1
     # mock.call_count = 调用总次数。Bob 1 次成功 → 仓库.add 调 1 次
     assert stub_repo.add.call_count == 1
+    # bob 3 张全成功 → images_processed = 3, images_skipped = 0;
+    # alice 整人失败抛 PersonHasNoTemplatesError,这条路径 skipped 不累加
+    # (设计取舍:整人失败已用 persons_failed 单独计数,无需在 images_skipped 双重表达)
+    assert summary.images_processed == 3
+    assert summary.images_skipped == 0
+
+
+def test_partial_failure_accumulates_skipped(
+    tmp_path: Path,
+    stub_repo: MagicMock,
+    fake_image_loader,
+    make_encoding,
+):
+    """部分失败的人:成功一张 + 失败两张 → images_skipped=2 累加进 summary。"""
+    _make_person_dir(tmp_path, "alice", 3)
+    pipeline = MagicMock()
+    pipeline.encode_single.side_effect = [
+        make_encoding(0),  # 成功
+        NoFaceError("无脸"),
+        NoFaceError("无脸"),
+    ]
+
+    use_case = RegisterFace(
+        pipeline=pipeline,
+        repository=stub_repo,
+        # all_vectors 不要求多张,1 张也能注册——这样 alice 不会整人失败,skipped 才会被累加
+        strategy=AllVectorsStrategy(),
+        image_loader=fake_image_loader,
+    )
+    summary = use_case.execute(tmp_path)
+    assert summary.persons_succeeded == 1
+    assert summary.persons_failed == 0
+    assert summary.images_processed == 1
+    assert summary.images_skipped == 2
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -2006,17 +2212,22 @@ class RegisterFace:
         self._strategy = strategy
         self._load_image = image_loader
 
-    def execute_for_person(self, person_dir: Path) -> int:
-        """注册单个人。返回成功提取的图片数。失败抛 PersonHasNoTemplatesError。"""
+    def execute_for_person(self, person_dir: Path) -> tuple[int, int]:
+        """注册单个人。返回 (成功图片数, 跳过图片数)。失败抛 PersonHasNoTemplatesError。
+
+        跳过包含两类:扩展名不是图片(.txt/.DS_Store 等)、解码或检测失败(NoFaceError 等)。
+        调用方拿到这俩数字往 RegisterSummary 里累加,用户在 CLI 末尾能看到准确统计。
+        """
         # 显式标注 list[FaceEncoding]——空 list 的元素类型 mypy 推不出，主动告知
         encodings: list[FaceEncoding] = []
+        skipped = 0
         # Path.iterdir() = 列出该目录下所有条目（不递归），返回 Path 生成器。
         # sorted(...) 强制确定顺序——文件系统遍历顺序在不同平台不一致，
         # 排序保证测试和实际运行结果可复现。
         for img_path in sorted(person_dir.iterdir()):
             # Path.suffix = 文件扩展名（含点）。.lower() 防大写 .JPG 漏过滤。
             if img_path.suffix.lower() not in _IMG_EXTS:
-                continue  # 跳过非图片（如 .DS_Store、.txt 标注文件）
+                continue  # 跳过非图片（如 .DS_Store、.txt 标注文件）—不计入 skipped,扩展名过滤是预筛
             try:
                 img = self._load_image(img_path)
                 enc = self._pipeline.encode_single(img)
@@ -2029,6 +2240,7 @@ class RegisterFace:
                 # 优势 vs f-string：仅在 WARNING 级别真的输出时才做字符串拼接，
                 # 调用 .debug() 时如果当前级别是 INFO，省下拼接成本（虽然这里不重要）
                 logger.warning("跳过 %s: %s", img_path, e)
+                skipped += 1
 
         # 全部失败 → 这个人彻底注册不上，向上抛
         if not encodings:
@@ -2046,7 +2258,7 @@ class RegisterFace:
             templates=tuple(templates),
         )
         self._repo.add(person)
-        return len(encodings)
+        return len(encodings), skipped
 
     def execute(self, dataset_dir: Path) -> RegisterSummary:
         """批量注册整个数据集。"""
@@ -2057,9 +2269,10 @@ class RegisterFace:
             if not person_dir.is_dir():
                 continue
             try:
-                n = self.execute_for_person(person_dir)
+                n_ok, n_skip = self.execute_for_person(person_dir)
                 succeeded += 1
-                images_processed += n
+                images_processed += n_ok
+                images_skipped += n_skip
             # 单人失败时**不向上传播**——只记 error 然后继续下一个人。
             # 这是"批处理容错"的标准做法：1 个人挂了不连累整批。
             except PersonHasNoTemplatesError as e:
@@ -2079,7 +2292,7 @@ class RegisterFace:
 uv run pytest tests/unit/test_register_face.py -v
 ```
 
-预期：4 passed
+预期：5 passed
 
 - [ ] **Step 5: commit**
 
@@ -2263,9 +2476,24 @@ git commit -m "feat(application): 加 RecognizeFace 用例（一次矩阵乘法 
 
 **Files:**
 - Create: `src/face_recognition/infrastructure/insightface_pipeline.py`
-- Test: `tests/integration/test_insightface_pipeline.py`（标记 `@pytest.mark.gpu`）
+- Test: `tests/integration/test_insightface_pipeline.py`（标记 `@pytest.mark.integration`）
 
-这是唯一调用 `insightface` 库的地方。集成测试用 `insightface.app.FaceAnalysis()` 自带的示例图。**测试默认跳过**（需要下载模型 + 较慢），用 `pytest -m gpu` 显式跑。
+> **测试 marker 命名约定**：所有"真模型 + 真 SQLite"的集成测试一律打 `@pytest.mark.integration`。
+> 默认 `pytest` 只跑单元测试（毫秒级），`pytest -m integration` 才显式跑这一批。
+> 之所以不叫 `gpu`：我们用 `ctx_id=-1` 强制走 CPU，名字会误导贡献者以为必须有显卡。
+
+这是唯一调用 `insightface` 库的地方。集成测试用 `insightface.app.FaceAnalysis()` 自带的示例图。**测试默认跳过**（需要下载模型 + 较慢），用 `pytest -m integration` 显式跑。
+
+> **pyproject.toml 必须先注册 marker**（M0 已加 `gpu`/`slow`，本任务里改成 `integration`）：
+> ```toml
+> [tool.pytest.ini_options]
+> markers = [
+>     "integration: 集成测试（真模型 + 真 SQLite，需要本地下载的 buffalo_l 权重）",
+>     "slow: 耗时 > 1 秒的测试",
+> ]
+> addopts = "-ra --strict-markers"
+> ```
+> `--strict-markers` 让未注册的 marker 直接报错，能在 PR 阶段抓到名字写错的情况。
 
 - [ ] **Step 1: 写集成测试 `tests/integration/test_insightface_pipeline.py`**
 
@@ -2278,9 +2506,9 @@ from face_recognition.infrastructure.insightface_pipeline import InsightFacePipe
 
 
 # pytestmark = pytest.mark.xxx 是模块级标记：本文件所有测试都打上 xxx 标签。
-# 这里给所有测试打 @pytest.mark.gpu，等价于在每个 test_ 函数前加 @pytest.mark.gpu。
-# 配合 pyproject.toml 里 markers = ["gpu: ..."]，运行 pytest -m gpu 才跑这些。
-pytestmark = pytest.mark.gpu
+# 这里给所有测试打 @pytest.mark.integration，等价于在每个 test_ 函数前加 @pytest.mark.integration。
+# 配合 pyproject.toml 里 markers = ["integration: ..."]，运行 pytest -m integration 才跑这些。
+pytestmark = pytest.mark.integration
 
 
 # scope="module" = fixture 的"生存期"。
@@ -2297,7 +2525,7 @@ def pipeline() -> InsightFacePipeline:
 def test_encode_single_on_real_face(pipeline: InsightFacePipeline):
     """用 InsightFace 包内置示例图测试一张正常人脸的端到端流程。"""
     # 函数内 import：测试套件层面只在真跑时才 import insightface，
-    # 避免模块加载阶段就 import 重型库——配合 -m "not gpu" 跳过的场景
+    # 避免模块加载阶段就 import 重型库——配合 -m "not integration" 跳过的场景
     import insightface
     from pathlib import Path
     # insightface.__file__ = insightface 包的入口文件路径。
@@ -2333,7 +2561,7 @@ import numpy as np
 from insightface.app import FaceAnalysis
 
 from face_recognition.domain.entities import FaceEncoding
-from face_recognition.domain.errors import MultipleFacesError, NoFaceError
+from face_recognition.domain.errors import EncodingError, MultipleFacesError, NoFaceError
 
 
 class InsightFacePipeline:
@@ -2350,6 +2578,9 @@ class InsightFacePipeline:
         det_size: tuple[int, int] = (640, 640),
     ) -> None:
         self._model_pack = model_pack
+        # 暴露给 FacePipeline Protocol 的 model_version 属性。
+        # 评估侧用它构造 FaceEncoding,避免硬编码 "buffalo_l"。
+        self.model_version = model_pack
         # FaceAnalysis(name="buffalo_l") = 选择模型组合包。
         # 首次调用会自动从云端下载到 ~/.insightface/models/ 缓存（约 300MB）。
         self._app = FaceAnalysis(name=model_pack)
@@ -2393,14 +2624,16 @@ class InsightFacePipeline:
         # 1e-12 是非常严格的"接近 0"判定。InsightFace 正常输出永远不会是零向量，
         # 出现 → 模型加载失败或输入有严重问题，应立即报错而非除以 0 出 NaN。
         if n < 1e-12:
-            raise ValueError("InsightFace 输出零向量，模型异常")
+            # 用领域异常而非裸 ValueError,与 errors.py 异常层次一致——
+            # 上层全局 handler/CLI 可以按 FaceRecognitionError 基类统一捕获。
+            raise EncodingError("InsightFace 输出零向量,模型异常")
         return v / n
 ```
 
 - [ ] **Step 3: 跑集成测试（首次会下载 buffalo_l 模型，约 300MB）**
 
 ```bash
-uv run pytest tests/integration/test_insightface_pipeline.py -v -m gpu
+uv run pytest tests/integration/test_insightface_pipeline.py -v -m integration
 ```
 
 预期：2 passed（首次跑约 1~3 分钟，含模型下载）
@@ -2408,7 +2641,7 @@ uv run pytest tests/integration/test_insightface_pipeline.py -v -m gpu
 - [ ] **Step 4: 默认套件不跑这些（快）**
 
 ```bash
-uv run pytest -v -m "not gpu"
+uv run pytest -v -m "not integration"
 ```
 
 预期：之前所有单测 pass，集成被跳过
@@ -2591,14 +2824,13 @@ app = typer.Typer(
 # 用途：装载配置、初始化日志，把结果通过 typer.Context 传给子命令。
 @app.callback()
 def _setup(
+    # typer.Context 必须是**第一个**形参,且不给默认值——Typer 会在调用时自动注入真实 Context;
+    # 给 None 默认值是老版本写法,会触发 mypy 警告还需 `# type: ignore`,反而掩盖真正的类型问题。
+    ctx: typer.Context,
     # typer.Option(default, "--name", "-n", help="...") = 声明一个选项。
-    #   - 第一个位置参数 = 默认值（"..." Ellipsis 表示"必填"，普通值表示"可选"）
+    #   - 第一个位置参数 = 默认值("..." Ellipsis 表示"必填",普通值表示"可选")
     #   - 后续字符串 = CLI 上的长短选项名
     config: Path = typer.Option("config.yaml", "--config", "-c", help="配置文件路径"),
-    # typer.Context 是 Click 的 Context 对象，用来在父命令和子命令之间传共享状态。
-    # = None 仅为占位，Typer 实际会传入真实 Context。
-    # `# type: ignore[assignment]` 是 mypy 注释：忽略这一行的"None 不能赋给 Context"警告。
-    ctx: typer.Context = None,  # type: ignore[assignment]
 ) -> None:
     cfg = build_config(config)
     # logging.basicConfig 配置根 logger：级别 + 格式。
@@ -2739,8 +2971,8 @@ from face_recognition.infrastructure.insightface_pipeline import InsightFacePipe
 from face_recognition.infrastructure.sqlite_repository import SqliteRepository
 
 
-# 整文件标记为 GPU 测试——默认 pytest 跑不到，要 pytest -m gpu 显式触发
-pytestmark = pytest.mark.gpu
+# 整文件标记为集成测试——默认 pytest 跑不到，要 pytest -m integration 显式触发
+pytestmark = pytest.mark.integration
 
 
 # 模块级 pipeline fixture，复用 Task 10 同款写法（避免每个测试都重新加载模型）
@@ -2818,7 +3050,7 @@ def test_recognize_unknown_returns_none(
 - [ ] **Step 2: 跑集成测试**
 
 ```bash
-uv run pytest tests/integration/test_register_recognize_e2e.py -v -m gpu
+uv run pytest tests/integration/test_register_recognize_e2e.py -v -m integration
 ```
 
 预期：2 passed（约 30 秒，复用之前 task 10 已下载的模型）
@@ -2827,7 +3059,7 @@ uv run pytest tests/integration/test_register_recognize_e2e.py -v -m gpu
 
 ```bash
 uv run pytest -v
-uv run pytest -v -m gpu
+uv run pytest -v -m integration
 ```
 
 预期：单元测试全部 pass；集成测试全部 pass
@@ -2870,8 +3102,8 @@ uv run python -m face_recognition.api.cli remove yourself
 
 执行完 13 个任务，M1 算完整交付，必须满足：
 
-- [ ] `uv run pytest -m "not gpu"` 全部 pass（单元测试）
-- [ ] `uv run pytest -m gpu` 全部 pass（集成测试，含端到端）
+- [ ] `uv run pytest -m "not integration"` 全部 pass（单元测试）
+- [ ] `uv run pytest -m integration` 全部 pass（集成测试，含端到端；M0 时若 marker 名为 `gpu` 一并改成 `integration`）
 - [ ] `uv run ruff check src tests` 0 错误
 - [ ] `uv run mypy src/face_recognition` 0 错误
 - [ ] CLI 四条命令（register / recognize / list / remove）手动跑通

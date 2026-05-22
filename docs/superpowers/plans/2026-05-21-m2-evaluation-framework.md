@@ -10,6 +10,174 @@
 
 ---
 
+## §0 动手前先弄清楚的概念（必读）
+
+> 这一节是**给零基础同学的方法论入门**——只讲"为什么"和"是什么"，不讲代码。如果你已经熟悉评估三元组 / ROC / EER 等术语，可以跳到任务清单。
+>
+> 完整方法论沉淀在 `docs/evaluation-methodology.md`（答辩报告底稿）。本节是它的精炼版，目的是让 agent 在写代码时**理解每行代码在评估学上的位置**。
+
+### §0.1 我们到底在评估什么？
+
+**不是**评估 InsightFace 模型本身——它的权重冻结，性能由作者背书。
+**是**评估"一个人怎么从 N 张照片浓缩成模板"这件事——**5 个候选策略二选一**。
+
+| 策略 | 一人多少模板 | 一句话原理 |
+| --- | --- | --- |
+| `random_one` | 1 | 随机抽 1 张 |
+| `mean_all` | 1 | 全部向量直接平均 |
+| `manual_three` | 3 | 人工挑 3 张代表照 |
+| `kmeans_k3` | 3 | KMeans 聚 3 簇取质心 |
+| `all_vectors` | N | 全部存,不浓缩 |
+
+最终目标：**用数据证明哪个策略适合 35 人规模的部署**，把结论写进答辩报告。
+
+### §0.2 4 个绝对要先理解的底层事实
+
+1. **人脸 = 512 维向量**。InsightFace 把每张脸压成 512 个浮点数,叫 embedding。
+2. **像不像 = 余弦相似度**。两个 L2 归一化向量做点积,范围 [-1, 1],越接近 1 越像。
+3. **识别 = 设阈值 τ**。`相似度 > τ` 判同人,否则判陌生人。
+4. **本系统是开放集（open-set）**。会有完全没注册的人来刷脸——这跟"35 选 1"的闭集分类完全两回事,**所有指标都为这件事服务**。
+
+### §0.3 数据切分：为什么"按人"切而不是"按图"切
+
+朴素做法：35 人 × 20 张 = 700 张,随机 80/20 拆。**错。**
+按图切的问题：测试集里的每个人都在训练集出现过——评估不到"陌生人来刷脸"的能力。
+
+**正确做法（按人切）：**
+
+```
+35 人 → 28 人进注册集 + 7 人扮演库外候选
+对 28 注册人：每人 20 张 → 16 张生成模板 + 4 张做测试图
+另外:从 LFW 抽 50 个完全无关的陌生人,组成"库外陌生人"集
+```
+
+`RANDOM_SEED = 42` 固定到 `config.yaml`,保证可复现。
+
+### §0.4 三种 pair：开放集评估的核心设计
+
+我们生成三类配对(pair),每对一个相似度分数:
+
+| 类型 | 怎么造 | 模拟什么 |
+| --- | --- | --- |
+| **Genuine** | 28 个注册人各自的本人照片配对 | 张三本人来刷脸 |
+| **In-library Impostor** | 28 人之间互相配对 | 注册者 A 被错认成 B |
+| **Out-of-library Impostor** | 7 + 50 个陌生人 vs 28 人模板 | 路人甲来蹭门禁 |
+
+**为什么必须分开第二种和第三种?**
+两类陌生人的相似度分布**完全不一样**:库内冒充的人(同光线、同年龄段、同设备)相似度天然偏高,LFW 陌生人则天然偏低。混在一起算阈值会**人为压低边界**,让评估"看着安全实际不安全"。分开报指标 = 开放集的诚实评估。
+
+### §0.5 4 类核心指标(每一类都答辩可能被问)
+
+#### (a) FAR / FRR —— 一切的基础
+
+给定阈值 τ:
+
+| 缩写 | 全称 | 含义 |
+| --- | --- | --- |
+| **FAR** | False Accept Rate | 陌生人被错判为熟人的概率(**安全风险**) |
+| **FRR** | False Reject Rate | 熟人被错判为陌生人的概率(**体验损伤**) |
+| **TAR** | True Accept Rate = 1 - FRR | 熟人成功被识别的概率 |
+
+阈值控制此消彼长:τ 小 → 宽松 → FAR 高 / FRR 低;τ 大 → 严格 → 反之。
+
+> ⚠️ **不要用 Accuracy**——pair 正负样本比例是设计出来的,Accuracy 完全失真。
+
+#### (b) ROC 曲线 + AUC —— 阈值无关的判别能力
+
+**ROC = Receiver Operating Characteristic curve**(术语来自二战雷达)。
+画法:**所有阈值都扫一遍**,每个 τ 算 (FAR, TAR),横轴 FAR 纵轴 TAR 连成曲线。
+
+```
+TAR 1 ┤      ╭───── ← 完美(贴左上角)
+      │   ╱
+   .8 ┤ ╱   ← 我们的系统
+      │╱  ╭─── 一般
+   .5 ┤  ╱
+      │ ╱  ← 对角线 = 随机猜测(AUC=0.5)
+    0 ┴──────→ FAR
+      0   .5    1
+```
+
+**AUC = Area Under Curve**,范围 [0.5, 1.0]。
+**物理意义**:随机抽一对 genuine 和一对 impostor,模型给 genuine 分数高于 impostor 的概率。
+
+> ROC 评的是"模型的判别能力"——像一把尺子的精度。τ 选多少 = "怎么用这把尺子量东西"。先评尺子,再选刻度。
+
+#### (c) EER(等错误率)—— 单一可比数
+
+**EER = Equal Error Rate**:FAR = FRR 时的那个值。
+ROC 曲线和"y = 1 - x"对角线的交点对应的错误率。
+
+EER 越小越好。它的价值是**给你一个数让 5 个策略横比**:
+
+| Strategy | EER |
+| --- | --- |
+| random_one | 8.2% |
+| kmeans_k3 | 4.3% |
+| ... |  |
+
+PPT 首页就放这张表。
+
+#### (d) TAR@FAR=x —— 部署决策点
+
+EER 是"理论平衡点",但真实部署不一定要平衡:
+- 银行 ATM 要 FAR ≤ 1e-6(百万分之一容错)
+- 教学楼自习室门禁可以 FAR ≤ 1e-2
+
+所以工业界报告必有 **"当 FAR 卡在 X 时,TAR 多少"**。spec 里我们设三档:`[1e-3, 1e-2, 1e-1]`。
+
+**这是业务决策直接看的数字**,比 EER 更实用。
+
+#### (e) Top-1 准确率 —— 闭集补充
+
+> 给一张测试图,在 28 个人中"最相似的人是不是真身"?
+
+ROC 评"判别陌生人能力",Top-1 评"在熟人中找对人能力",两者互补。
+**多模板时一定用 max 口径**:Bob 有 3 个模板时,他的得分 = `max(cos(q, t_i))`——和生产代码对齐(详见 Task 5)。
+
+### §0.6 答辩报告的"主声明"长什么样(成品预览)
+
+> 「在我们的私有数据集(28 注册 + 7 库外 + 50 LFW 库外)上对比 5 种模板生成策略:
+> - `random_one` 因依赖单张照片质量,EER=8.2% 显著劣于其他方案
+> - `mean_all` (EER=6.5%) 受制于"平均后特征模糊",落后 3 模板系列约 2 个百分点
+> - `manual_three` (4.1%) 与 `kmeans_k3` (4.3%) 性能接近,但 kmeans_k3 无需人工标注,**可复现性更优**
+> - `all_vectors` (4.0%) 仅微小领先,但**存储成本是 7 倍**
+>
+> **综合精度、存储成本、可复现性三个维度,选择 `kmeans_k3` 作为部署策略。**」
+
+下面所有 Task 都是为了让你最后能输出这一段话。
+
+### §0.7 流水线一图流
+
+```
+data_split  ──→  按人 80/20 切    (Task 2)
+    │
+    ▼
+lfw_loader  ──→  抽 50 个 LFW 陌生人    (Task 3)
+    │
+    ▼
+embedder    ──→  把所有图变 EvalEncoding    (Task 7)
+    │
+    ▼
+template strategies(5个)  ──→  每个策略产出"每人多少模板"    (复用 M1 实现)
+    │
+    ▼
+pair_generator  ──→  造 3 类 pair + 算余弦相似度    (Task 4)
+    │
+    ▼
+metrics  ──→  ROC / AUC / EER / TAR@FAR / Top-1    (Task 5)
+    │
+    ▼
+reports  ──→  CSV 表 + ROC 叠图 + summary.md    (Task 6)
+    │
+    ▼
+run_ablation  ──→  编排 5 策略 × 3 评估组,跑一遍    (Task 8)
+```
+
+每个 Task 现在你应该能说清"它在评估学上是干嘛的"。继续往下看代码细节。
+
+---
+
 ## 任务清单（10 个）
 
 > 教材风格：首次出现的 API/装饰器/方法详细解释，第二次起从简。M1 已经讲过的（np.linalg.norm、np.stack、np.random.default_rng、@dataclass(frozen=True)、Protocol、pytest fixture、cv2.imread 等）一律不再重复。
@@ -78,17 +246,22 @@ def test_pair_result_carries_score_and_label():
 
 
 def test_strategy_metrics_holds_all_indicators():
-    # StrategyMetrics 是给 reports 模块的统一交付物——5 策略每个一份
+    # StrategyMetrics 是给 reports 模块的统一交付物——5 策略每个一份。
+    # ── 给小白：每个数到底是什么意思 ──
     m = StrategyMetrics(
         strategy_name="kmeans_k3",
-        eer=0.04,
-        eer_threshold=0.62,
-        tar_at_far_1e3=0.91,
-        top1_accuracy=0.96,
-        roc_fpr=np.array([0.0, 0.5, 1.0]),
-        roc_tpr=np.array([0.0, 0.95, 1.0]),
-        n_genuine=200,
-        n_impostor=4500,
+        eer=0.04,                  # EER=4%：FAR 和 FRR 同时降到 4% 的最佳折中点。
+                                   # ArcFace 在小库（35 人）上典型 1%~5%，4% 算正常水平。
+        eer_threshold=0.62,        # 达到 EER 时的相似度阈值——余弦点积 ≥ 0.62 判同人。
+                                   # 实际部署阈值常乘 1.05~1.10 让 FAR 更低（误识别比漏识别危险）。
+        tar_at_far_1e3=0.91,       # 在 FAR=0.1%（每千次陌生人比对只放 1 个进来）这个安全约束下，
+                                   # 91% 的本人能被正确识别。门禁场景常用这个指标——FAR 是硬约束。
+        top1_accuracy=0.96,        # 闭集 Top-1 准确率 96%：只看"和谁最像"不看分数高低，最像的 96% 是本人。
+        top1_with_threshold=0.93,  # 加上阈值后的 Top-1：相似度 ≥ eer_threshold 才接受，剩下 93%。
+        roc_fpr=np.array([0.0, 0.5, 1.0]),  # ROC 曲线 X 轴 = FAR/FPR 数组（去重后阈值数）
+        roc_tpr=np.array([0.0, 0.95, 1.0]),  # ROC 曲线 Y 轴 = TAR/TPR；FPR/TPR 是 sklearn 命名（与本项目 FAR/TAR 等价）
+        n_genuine=200,             # 生成的"同人"配对数
+        n_impostor=4500,           # 生成的"陌生人"配对数（通常远多于 genuine）
     )
     assert m.strategy_name == "kmeans_k3"
     assert 0.0 < m.eer < 1.0
@@ -149,7 +322,8 @@ class StrategyMetrics:
     eer: float                 # Equal Error Rate
     eer_threshold: float       # 达到 EER 的相似度阈值
     tar_at_far_1e3: float      # 卡 FAR=0.1% 时的真员工接受率
-    top1_accuracy: float       # 闭集 Top-1（同人 query 找最相似 → 是不是本人）
+    top1_accuracy: float       # 闭集 Top-1 无阈值版（衡量纯排序能力）
+    top1_with_threshold: float # 闭集 Top-1 带阈值版（== 生产识别成功率;阈值默认用 EER 阈值）
     # field(default_factory=...) 是 dataclass 的"工厂默认值"语法。
     #   - 不能写 `roc_fpr: np.ndarray = np.array([])`——所有实例会**共享同一个数组**
     #     （和 list/dict 默认参数同样的坑）
@@ -393,8 +567,17 @@ def test_load_lfw_subset_uses_seed_for_determinism():
     fake_bunch.target = np.arange(200)
     fake_bunch.target_names = np.array([f"P{i}" for i in range(200)])
 
-    # patch 装饰器：在测试期间把目标对象替换成 mock，结束后还原
-    # 字符串路径要写"被使用的位置"——lfw_loader.py 里 import 之后的 fetch_lfw_people 引用
+    # patch 装饰器：在测试期间把目标对象替换成 mock，结束后还原。
+    # ── 给小白：为什么 patch 路径写 lfw_loader.fetch_lfw_people 而不是 sklearn.datasets.fetch_lfw_people ──
+    # 这是 mock.patch **最容易踩的坑**："patch 的目标是被使用的位置，不是定义位置。"
+    #   1) `lfw_loader.py` 顶部写了 `from sklearn.datasets import fetch_lfw_people`，
+    #      这一刻 Python 把函数对象绑定到 lfw_loader 模块下的同名变量上——`lfw_loader.
+    #      fetch_lfw_people` 现在指向那个函数。
+    #   2) 后续 `load_lfw_subset` 内部调用的是 `lfw_loader.fetch_lfw_people` 这个**模块属性**。
+    #   3) patch 要替换的就是这个属性。如果误写 `patch("sklearn.datasets.fetch_lfw_people")`，
+    #      只改了 sklearn 那边的引用——lfw_loader 里早已绑定的旧引用一动不动，mock 失效，
+    #      测试还是会真的去下载 LFW 数据集（500MB，且联网失败就报错）。
+    # 一句话记法：**patch 谁 import 它的那个文件**，不是 patch 它定义的地方。
     with patch("face_recognition.evaluation.lfw_loader.fetch_lfw_people", return_value=fake_bunch):
         a = load_lfw_subset(n_persons=10, seed=42)
         b = load_lfw_subset(n_persons=10, seed=42)
@@ -458,8 +641,10 @@ def load_lfw_subset(n_persons: int = 50, seed: int = 42) -> list[LfwImage]:
         candidate_idx = np.where(bunch.target == pid)[0]
         # 该人多张图里取第一张就行（评估侧不关心选哪张，只关心是陌生人）
         first_idx = int(candidate_idx[0])
-        # bunch.images 是 (N, H, W, 3) float64 范围 0~255；要转 uint8 给 InsightFace
-        img_uint8 = bunch.images[first_idx].astype(np.uint8)
+        # bunch.images 是 (N, H, W, 3) float64 范围 0~255；要转 uint8 给 InsightFace。
+        # 注意 .astype(np.uint8) 是**截断**(254.7→254)而非四舍五入,在大批量上会有轻微亮度偏暗;
+        # np.clip 防止极端值溢出后 .round() 才四舍五入,再 .astype 类型转换。
+        img_uint8 = np.clip(bunch.images[first_idx], 0, 255).round().astype(np.uint8)
         images.append(LfwImage(
             image=img_uint8,
             person_name=str(bunch.target_names[pid]),
@@ -536,9 +721,10 @@ def _enc(person_id: str, seed: int, path: str = "x.jpg") -> EvalEncoding:
 def test_genuine_pairs_only_same_person():
     """Genuine 应该全部 is_genuine=True 且 query/template 同人。"""
     queries = [_enc("alice", 0), _enc("alice", 1), _enc("bob", 2)]
-    templates = {"alice": _enc("alice", 10), "bob": _enc("bob", 11)}
+    # templates 改为 dict[str, list[EvalEncoding]],对齐多模板评估口径。
+    templates = {"alice": [_enc("alice", 10)], "bob": [_enc("bob", 11)]}
     pairs = generate_genuine_pairs(queries, templates)
-    # 3 个 query 各自和"自己人"的 template 配对 → 3 个 PairResult
+    # 3 个 query 各自和"自己人"的模板组配对 → 3 个 PairResult
     assert len(pairs) == 3
     assert all(p.is_genuine for p in pairs)
     assert all(p.query_person == p.template_person for p in pairs)
@@ -547,7 +733,7 @@ def test_genuine_pairs_only_same_person():
 def test_genuine_pairs_skip_query_without_template():
     """如果某人在 templates 里没有条目，他的 query 应该被跳过（不报错）。"""
     queries = [_enc("alice", 0), _enc("ghost", 1)]
-    templates = {"alice": _enc("alice", 10)}
+    templates = {"alice": [_enc("alice", 10)]}
     pairs = generate_genuine_pairs(queries, templates)
     assert len(pairs) == 1
     assert pairs[0].query_person == "alice"
@@ -556,9 +742,13 @@ def test_genuine_pairs_skip_query_without_template():
 def test_closed_impostor_only_different_person():
     """库内 Impostor 必须 query_person != template_person。"""
     queries = [_enc("alice", 0)]
-    templates = {"alice": _enc("alice", 10), "bob": _enc("bob", 11), "carol": _enc("carol", 12)}
+    templates = {
+        "alice": [_enc("alice", 10)],
+        "bob":   [_enc("bob", 11)],
+        "carol": [_enc("carol", 12)],
+    }
     pairs = generate_closed_impostor_pairs(queries, templates)
-    # alice 的 query 配 bob、carol 的 template → 2 对
+    # alice 的 query 配 bob、carol 的模板组 → 2 对
     assert len(pairs) == 2
     assert all(not p.is_genuine for p in pairs)
     assert all(p.query_person != p.template_person for p in pairs)
@@ -567,7 +757,7 @@ def test_closed_impostor_only_different_person():
 def test_open_impostor_pairs_all_negative():
     """库外陌生人 vs 库内任何 template → 全部 is_genuine=False。"""
     lfw_queries = [_enc("LFW_Stranger_1", 0, "lfw/x.jpg")]
-    templates = {"alice": _enc("alice", 10), "bob": _enc("bob", 11)}
+    templates = {"alice": [_enc("alice", 10)], "bob": [_enc("bob", 11)]}
     pairs = generate_open_impostor_pairs(lfw_queries, templates)
     assert len(pairs) == 2
     assert all(not p.is_genuine for p in pairs)
@@ -577,7 +767,7 @@ def test_score_is_cosine_similarity():
     """分数 = 单位向量点积（余弦相似度，范围 [-1, 1]，同向接近 1）。"""
     # 自己跟自己点积 = 1
     same = _enc("alice", 0)
-    pairs = generate_genuine_pairs([same], {"alice": same})
+    pairs = generate_genuine_pairs([same], {"alice": [same]})
     # 浮点比较留余地（np.float32 累加误差通常 < 1e-6）
     assert pairs[0].score == pytest.approx(1.0, abs=1e-6)
 ```
@@ -606,50 +796,55 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
+def _max_cosine(query: np.ndarray, templates: list[EvalEncoding]) -> float:
+    """对一组同人模板取最高相似度——评估口径与生产 RecognizeFace 一致。
+
+    多模板策略(kmeans_k3 / all_vectors)的本意是"覆盖同一人的不同视角/光照",
+    检索时只要 query 和**任何一个**模板足够近就视为命中,所以应该 max 而非 mean。
+    """
+    return max(_cosine(query, t.vector) for t in templates)
+
+
 def generate_genuine_pairs(
     queries: list[EvalEncoding],
-    templates: dict[str, EvalEncoding],
+    templates: dict[str, list[EvalEncoding]],
 ) -> list[PairResult]:
-    """同人配对：每个 query 找到自己 person_id 对应的 template。
+    """同人配对:每个 query 对自己 person_id 的模板组取 max 相似度。
 
-    queries: 测试集（每张测试图一个 EvalEncoding）
-    templates: 注册集产物（多模板策略压缩后每人 1 个 EvalEncoding——
-               策略给出多个时这里取代表向量；具体策略侧的事 Task 7 再细谈）
+    queries: 测试集(每张测试图一个 EvalEncoding)
+    templates: 每人 1~N 个模板向量(取决于策略),scoring 时取 max。
     """
     pairs: list[PairResult] = []
     for q in queries:
-        # dict.get 在 key 不存在时返回 None，不抛 KeyError——
-        # 这里允许"测试集出现库里没有的人"，体现开放集场景的健壮性
-        tpl = templates.get(q.person_id)
-        if tpl is None:
+        # dict.get 在 key 不存在时返回 None,不抛 KeyError——
+        # 允许"测试集出现库里没有的人",体现开放集场景的健壮性
+        tpls = templates.get(q.person_id)
+        if not tpls:
             continue
         pairs.append(PairResult(
-            score=_cosine(q.vector, tpl.vector),
+            score=_max_cosine(q.vector, tpls),
             is_genuine=True,
             query_person=q.person_id,
-            template_person=tpl.person_id,
+            template_person=q.person_id,
         ))
     return pairs
 
 
 def generate_closed_impostor_pairs(
     queries: list[EvalEncoding],
-    templates: dict[str, EvalEncoding],
+    templates: dict[str, list[EvalEncoding]],
 ) -> list[PairResult]:
-    """库内异人配对：query 和库里**其他人**的 template 配。
+    """库内异人配对:query 对**其他人**的模板组取 max 相似度。
 
-    数量级：N 个测试 query × (M-1) 个其他模板 → 增长很快，
-    35 人每人 10 张测试 → 350 × 34 = 11900 对。spec 已决定**不上线**这组评估，
-    但函数留着以备后续切回来。
+    spec 已决定省去库内 Impostor,函数留着以备切回。
     """
     pairs: list[PairResult] = []
     for q in queries:
-        # dict.items() 同时拿 (key, value)——比 for k in d 再 d[k] 高效一点
-        for tpl_pid, tpl in templates.items():
+        for tpl_pid, tpls in templates.items():
             if tpl_pid == q.person_id:
-                continue  # 跳过同人，那是 genuine 的活
+                continue  # 跳过同人,那是 genuine 的活
             pairs.append(PairResult(
-                score=_cosine(q.vector, tpl.vector),
+                score=_max_cosine(q.vector, tpls),
                 is_genuine=False,
                 query_person=q.person_id,
                 template_person=tpl_pid,
@@ -659,18 +854,18 @@ def generate_closed_impostor_pairs(
 
 def generate_open_impostor_pairs(
     lfw_queries: list[EvalEncoding],
-    templates: dict[str, EvalEncoding],
+    templates: dict[str, list[EvalEncoding]],
 ) -> list[PairResult]:
-    """库外陌生人配对：LFW 里的人作为 query，配库里所有 template。
+    """库外陌生人配对:LFW 人作为 query,对每个库内人的模板组取 max 相似度。
 
-    所有产出 is_genuine=False（陌生人不可能"是"库里的任何人）。
-    数量级：50 个 LFW × 35 个库内 → 1750 对，比库内 impostor 小一个量级。
+    所有产出 is_genuine=False(陌生人不可能"是"库里的任何人)。
+    数量级:50 个 LFW × 35 个库内 → 1750 对。
     """
     pairs: list[PairResult] = []
     for q in lfw_queries:
-        for tpl_pid, tpl in templates.items():
+        for tpl_pid, tpls in templates.items():
             pairs.append(PairResult(
-                score=_cosine(q.vector, tpl.vector),
+                score=_max_cosine(q.vector, tpls),
                 is_genuine=False,
                 query_person=q.person_id,   # "LFW_xxx" 风格的伪 ID
                 template_person=tpl_pid,
@@ -782,13 +977,38 @@ def test_top1_accuracy_picks_correct_template():
         EvalEncoding(vector=a.astype(np.float32), person_id="A", image_path=""),
         EvalEncoding(vector=b.astype(np.float32), person_id="B", image_path=""),
     ]
+    # 每人 1 个模板的简单情形——多模板由 _max_cosine 路径覆盖
     templates = {
-        "A": EvalEncoding(vector=a.astype(np.float32), person_id="A", image_path=""),
-        "B": EvalEncoding(vector=b.astype(np.float32), person_id="B", image_path=""),
-        "C": EvalEncoding(vector=c.astype(np.float32), person_id="C", image_path=""),
+        "A": [EvalEncoding(vector=a.astype(np.float32), person_id="A", image_path="")],
+        "B": [EvalEncoding(vector=b.astype(np.float32), person_id="B", image_path="")],
+        "C": [EvalEncoding(vector=c.astype(np.float32), person_id="C", image_path="")],
     }
     acc = compute_top1_accuracy(test, templates)
     assert acc == pytest.approx(1.0)
+
+
+def test_top1_with_threshold_rejects_low_scores():
+    """带阈值的 Top-1:即便 argmax 选对人,分数 < threshold 也算错(判 unknown)。"""
+    from face_recognition.evaluation.metrics import compute_top1_with_threshold
+
+    rng = np.random.default_rng(0)
+    a = rng.standard_normal(512); a /= np.linalg.norm(a)
+    b = rng.standard_normal(512); b /= np.linalg.norm(b)
+    # 造一个"略偏离 a"的 query——还是和 a 最像,但 cos 不到阈值
+    a_blur = a + 0.5 * rng.standard_normal(512)
+    a_blur = a_blur / np.linalg.norm(a_blur)
+
+    test = [EvalEncoding(vector=a_blur.astype(np.float32), person_id="A", image_path="")]
+    templates = {
+        "A": [EvalEncoding(vector=a.astype(np.float32), person_id="A", image_path="")],
+        "B": [EvalEncoding(vector=b.astype(np.float32), person_id="B", image_path="")],
+    }
+    # 无阈值:argmax 选对了 A → 命中
+    assert compute_top1_accuracy(test, templates) == pytest.approx(1.0)
+    # 阈值 0.99 严格到 a_blur 都过不去 → 拒识 → 算错
+    assert compute_top1_with_threshold(test, templates, threshold=0.99) == pytest.approx(0.0)
+    # 阈值 0.0 形同虚设 → 退化到无阈值 Top-1
+    assert compute_top1_with_threshold(test, templates, threshold=0.0) == pytest.approx(1.0)
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -815,6 +1035,14 @@ def _pairs_to_arrays(pairs: list[PairResult]) -> tuple[np.ndarray, np.ndarray]:
     """把 PairResult 列表拆成 (scores, labels) 数组，喂给 sklearn。"""
     # 列表推导式两次扫一遍——50K 量级配对下可忽略；如要优化可改用 np.fromiter
     scores = np.array([p.score for p in pairs], dtype=np.float64)
+    # ── 给小白：为什么 genuine（同人）= 1 而不是 0 ──
+    # 二分类里 "positive class（正例）" 不是"好人"的意思，而是"我们关心的事件"。
+    # 识别系统关心的是"本人来了能不能识别出来"——所以"同人"是正例，标 1。
+    # sklearn `roc_curve` 也按这个口径：TPR (True Positive Rate) = 把 label=1
+    # 的样本正确判为 1 的比例 = 本人被接受的比例 = 我们的 TAR。
+    # 反过来 FPR (False Positive Rate) = 把 label=0 的样本错判为 1 的比例 =
+    # 陌生人被错认为本人的比例 = 我们的 FAR。如果把 genuine=0 弄反了，TPR/FPR
+    # 的物理含义就跟着颠倒，画出来的 ROC 是镜像的，所有阈值都失效。
     labels = np.array([1 if p.is_genuine else 0 for p in pairs], dtype=np.int64)
     return scores, labels
 
@@ -833,6 +1061,18 @@ def compute_eer(pairs: list[PairResult]) -> tuple[float, float]:
       FRR = 1 - TPR
       条件 FAR = FRR → fpr = 1 - tpr → fpr + tpr = 1
     我们沿曲线找"|fpr - (1 - tpr)| 最小"的点，返回该点 fpr 当 EER。
+
+    ── 给小白：为什么 FRR = 1 - TPR 而不是 1 - FPR ──
+    新手最常混淆 FAR/FRR 的分母方向，记住一句话："两种错误率，分母不同"：
+        FAR = False Accept Rate = 陌生人被错误接受的比例
+              分母 = 所有陌生人配对总数（label=0 的样本）
+              = sklearn 的 FPR
+        FRR = False Reject Rate = 本人被错误拒绝的比例
+              分母 = 所有本人配对总数（label=1 的样本）
+              = 1 - TAR = 1 - TPR
+    所以 FRR ≠ 1 - FAR——它们的分母都不一样，不能直接相减。1 - TPR 才是
+    "label=1 里没被接受的那部分"，也就是 FRR。这个分母约定一旦理清，下面所有
+    阈值优化、EER 求解、TAR@FAR 才说得通。
     """
     fpr, tpr, thresholds = compute_roc(pairs)
     # 全数组运算 fpr - (1 - tpr) = fpr + tpr - 1
@@ -860,31 +1100,125 @@ def compute_tar_at_far(pairs: list[PairResult], target_far: float = 1e-3) -> flo
     return float(tpr[valid[-1]])
 
 
+def _flatten_templates(
+    templates: dict[str, list[EvalEncoding]],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """把所有人的所有模板拍平成 (T, 512) 矩阵 + (T,) 所属人索引 + person_id 列表。
+
+    返回的 flat_matrix 行顺序与 owner_arr / template_ids 严格对齐——多模板
+    max-by-template 聚合时要按 owner_arr 把分数 reduce 回每个 person。
+
+    ── 给小白：owner_arr 是干嘛用的（用 SQL 类比一下）──
+    假设 alice 有 3 个模板、bob 有 2 个，拍平后 flat_matrix 形状是 (5, 512)，
+    owner_arr = [0, 0, 0, 1, 1]——表示第 0/1/2 行属于第 0 个人 (alice)、
+    第 3/4 行属于第 1 个人 (bob)。下面 `np.maximum.at(out, owner_arr, scores)`
+    在做的事情，用 SQL 写就是：
+        SELECT MAX(score) FROM rows GROUP BY owner_arr
+    ——按 owner 分组、组内取最大相似度。这是"每人多模板取最大分"的向量化实现，
+    比 Python 双循环快几十倍。
+    """
+    template_ids = list(templates.keys())
+    flat_vectors: list[np.ndarray] = []
+    owner_index: list[int] = []
+    for pid_idx, pid in enumerate(template_ids):
+        for tpl in templates[pid]:
+            flat_vectors.append(tpl.vector)
+            owner_index.append(pid_idx)
+    if not flat_vectors:
+        return np.zeros((0, 512), dtype=np.float32), np.zeros(0, dtype=np.int64), template_ids
+    flat_matrix = np.stack(flat_vectors)
+    owner_arr = np.asarray(owner_index, dtype=np.int64)
+    return flat_matrix, owner_arr, template_ids
+
+
 def compute_top1_accuracy(
     test_set: list[EvalEncoding],
-    templates: dict[str, EvalEncoding],
+    templates: dict[str, list[EvalEncoding]],
 ) -> float:
-    """闭集 Top-1：每个 test 找余弦最相似的 template，命中本人则算对。
+    """**无阈值** 闭集 Top-1:对所有 person 取 max-by-template 相似度,argmax 命中本人则算对。
 
-    只统计 template 里有的那些人；test 里"陌生人"应已被调用方过滤。
+    用途:衡量"如果库内必有人,哪个最像"的纯排序能力——这是学术界对比模板生成
+    策略时的标准口径,不掺业务阈值。**不能**直接代表生产识别准确率,生产还会
+    被阈值拦下"似但不够似"的情况——那种场景请用 compute_top1_with_threshold。
+
+    只统计 template 里有的那些人;test 里"陌生人"应已被调用方过滤。
     """
-    # 把 templates 的 person_id 顺序固定下来，便于 argmax 后回查
-    template_ids = list(templates.keys())
-    if not template_ids:
+    flat_matrix, owner_arr, template_ids = _flatten_templates(templates)
+    if not template_ids or flat_matrix.shape[0] == 0:
         return 0.0
-    # np.stack 把多个一维向量堆成 (M, 512) 矩阵；axis=0 沿"人"维堆叠（默认）
-    template_matrix = np.stack([templates[pid].vector for pid in template_ids])
+    n_persons = len(template_ids)
 
     correct = 0
     total = 0
     for q in test_set:
         if q.person_id not in templates:
             continue  # 不在库里的人不计入闭集 Top-1
-        # 矩阵 × 向量 = (M, 512) @ (512,) = (M,) 得分向量
-        # @ 运算符就是 numpy.matmul 的语法糖
-        scores = template_matrix @ q.vector
-        pred = template_ids[int(np.argmax(scores))]
+        # ── 给小白：(T, 512) @ (512,) 形状广播魔法 ──
+        # flat_matrix 形状 (T, 512)，q.vector 形状 (512,)。
+        # numpy `@` 看到右边是 1D 向量时自动当列向量做矩阵乘 → 输出形状 (T,)。
+        # 每个元素 scores_flat[i] = q.vector 与第 i 个模板的点积 = 余弦相似度
+        # （前提：两个向量都已 L2 归一化）。
+        # 等价但慢 50~100 倍的写法：[np.dot(q.vector, t) for t in flat_matrix]。
+        # 用 @ 的版本走的是 numpy 的 BLAS 后端，单条指令跑完 T 次乘加。
+        scores_flat = flat_matrix @ q.vector
+        # ── 给小白：np.maximum.at 是什么 + 为什么要 -inf 初始化 ──
+        # `np.maximum.at(out, idx, src)` 等价于：
+        #     for i in range(len(idx)):
+        #         out[idx[i]] = max(out[idx[i]], src[i])
+        # 但用 C 实现，单次循环跑完几十倍快。它做的就是上面 owner_arr 注释里
+        # 那个"按 owner 分组取 max"的操作。
+        # 初始化用 -inf 而非 0 是因为：余弦相似度范围 [-1, 1]，可能为负；用 0
+        # 当初值，未被任何模板覆盖的人槽位会留 0 → np.argmax 可能错选这种"假高
+        # 分"的空人。-inf 比任何真实分数都小，没被覆盖到就永远是 -inf，argmax
+        # 不会选它。
+        per_person_max = np.full(n_persons, -np.inf, dtype=scores_flat.dtype)
+        np.maximum.at(per_person_max, owner_arr, scores_flat)
+        pred = template_ids[int(np.argmax(per_person_max))]
         if pred == q.person_id:
+            correct += 1
+        total += 1
+    return correct / total if total else 0.0
+
+
+def compute_top1_with_threshold(
+    test_set: list[EvalEncoding],
+    templates: dict[str, list[EvalEncoding]],
+    threshold: float,
+) -> float:
+    """**带阈值** 的 Top-1——对齐生产 RecognizeFace 的真实判定。
+
+    生产链路是:max-by-template 取最高分 → 若 < threshold 则判 unknown。
+    评估时对每个 genuine 测试样本(query 是注册者本人):
+      - 命中本人且分数 ≥ threshold → 算对
+      - argmax 错人 / 分数不够阈值 → 算错(包括"应识别成自己却被拒")
+
+    这个口径才是"用户实际在 M4 摄像头前看到的成功率"。报告里同时给两个 Top-1:
+      - top1_accuracy:无阈值,衡量纯排序能力(模型本质)
+      - top1_with_threshold:有阈值,衡量端到端可用性(部署后体感)
+    两者差距大 = 模型排序对但分数被压低,提示阈值偏严或同人内方差大。
+
+    阈值通常用对应策略的 EER 阈值或 TAR@FAR=1e-3 阈值——M2 主入口默认前者。
+    """
+    flat_matrix, owner_arr, template_ids = _flatten_templates(templates)
+    if not template_ids or flat_matrix.shape[0] == 0:
+        return 0.0
+    n_persons = len(template_ids)
+
+    correct = 0
+    total = 0
+    for q in test_set:
+        if q.person_id not in templates:
+            continue
+        scores_flat = flat_matrix @ q.vector
+        per_person_max = np.full(n_persons, -np.inf, dtype=scores_flat.dtype)
+        np.maximum.at(per_person_max, owner_arr, scores_flat)
+        best_idx = int(np.argmax(per_person_max))
+        best_score = float(per_person_max[best_idx])
+        # 阈值判拒:即便 argmax 选对人,分数太低也算"判 unknown"——错
+        if best_score < threshold:
+            total += 1
+            continue
+        if template_ids[best_idx] == q.person_id:
             correct += 1
         total += 1
     return correct / total if total else 0.0
@@ -896,7 +1230,7 @@ def compute_top1_accuracy(
 uv run pytest tests/unit/evaluation/test_metrics.py -v
 ```
 
-预期：5 passed
+预期：6 passed
 
 - [ ] **Step 5: commit**
 
@@ -944,6 +1278,7 @@ def _make_metrics(name: str, eer: float = 0.05) -> StrategyMetrics:
         eer_threshold=0.62,
         tar_at_far_1e3=0.91,
         top1_accuracy=0.96,
+        top1_with_threshold=0.93,
         roc_fpr=np.array([0.0, 0.05, 1.0]),
         roc_tpr=np.array([0.0, 0.95, 1.0]),
         n_genuine=200,
@@ -959,7 +1294,9 @@ def test_write_csv_creates_file_with_correct_columns(tmp_path: Path):
     # 用 pandas 读回来核对——别手撕 CSV 字符串
     import pandas as pd
     df = pd.read_csv(csv_path)
-    assert set(df.columns) >= {"strategy_name", "eer", "tar_at_far_1e3", "top1_accuracy"}
+    assert set(df.columns) >= {
+        "strategy_name", "eer", "tar_at_far_1e3", "top1_accuracy", "top1_with_threshold"
+    }
     assert len(df) == 2
 
 
@@ -1012,7 +1349,14 @@ uv run pytest tests/unit/evaluation/test_reports.py -v
 from pathlib import Path
 
 # matplotlib 在测试环境里默认会试图打开窗口，no-display 服务器上会报错。
-# 'Agg' 后端 = "anti-grain geometry"，纯写 PNG 不开 GUI。必须在 import pyplot 前设。
+# 'Agg' 后端 = "anti-grain geometry"，纯写 PNG 不开 GUI。
+# ── 给小白：为什么 use('Agg') 必须写在 import pyplot 之前 ──
+# matplotlib 在 `import matplotlib.pyplot` 这一刻会"锁定"当前后端——它内部初始化
+# 了图形管线、字体缓存、事件循环钩子等等，跟所选后端绑死。如果先 `import pyplot`
+# 再 `matplotlib.use("Agg")`，use() 只会发一行 UserWarning（不报错！）然后失效，
+# 服务器上跑测试会**莫名 segfault**（因为 GUI 后端找不到 DISPLAY）。
+# 安全做法：永远在文件最顶端、所有 pyplot 相关 import 之**前**调用 use()。
+# noqa: E402（如果 ruff 抱怨 use 后面有 import）也可以加，但顺序不能变。
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1034,6 +1378,7 @@ def write_csv(metrics: list[StrategyMetrics], output_path: Path) -> None:
             "eer_threshold": m.eer_threshold,
             "tar_at_far_1e3": m.tar_at_far_1e3,
             "top1_accuracy": m.top1_accuracy,
+            "top1_with_threshold": m.top1_with_threshold,
             "n_genuine": m.n_genuine,
             "n_impostor": m.n_impostor,
         }
@@ -1106,14 +1451,18 @@ def write_markdown(
     lines.append(f"覆盖 {len(metrics)} 个策略，每策略 Genuine/Impostor 配对见下表。\n")
     lines.append("## 总览\n")
     # Markdown 表格：表头 + 分隔行 + 数据行
-    lines.append("| Strategy | EER | TAR\\@FAR=1e-3 | Top-1 | EER thresh | n(Gen) | n(Imp) |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append(
+        "| Strategy | EER | TAR\\@FAR=1e-3 | Top-1 (no τ) | Top-1 (w/ τ) "
+        "| EER thresh | n(Gen) | n(Imp) |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|")
     for m in metrics:
         lines.append(
             f"| {m.strategy_name} "
             f"| {m.eer:.4f} "
             f"| {m.tar_at_far_1e3:.4f} "
             f"| {m.top1_accuracy:.4f} "
+            f"| {m.top1_with_threshold:.4f} "
             f"| {m.eer_threshold:.4f} "
             f"| {m.n_genuine} | {m.n_impostor} |"
         )
@@ -1182,11 +1531,17 @@ def _unit_vec(seed: int) -> np.ndarray:
 
 def test_encode_image_paths_returns_one_eval_encoding_per_path(tmp_path: Path):
     """encode_image_paths 应该跳过无脸/读取失败，返回有效编码列表。"""
-    # 造 3 个假 jpg 文件
+    # 造 3 个**真实可解码**的 jpg —— b"fake" 无法被 cv2.imread 解码,会让
+    # encode_image_paths 在 `if img is None: continue` 处全部跳过,
+    # 测试就会得到空列表(假阴性绿灯,看似过实则没测到主流程)。
+    # 内容随便填个 10×10 黑图就行,pipeline 后面被 mock 不看像素。
+    import cv2
+
     paths = []
+    blank = np.zeros((10, 10, 3), dtype=np.uint8)
     for i in range(3):
         p = tmp_path / f"alice_{i}.jpg"
-        p.write_bytes(b"fake")
+        cv2.imwrite(str(p), blank)
         paths.append(p)
 
     # mock pipeline：前两张正常返回向量，第三张抛 NoFaceError 模拟"无脸"
@@ -1243,7 +1598,7 @@ import cv2
 import numpy as np
 
 # 复用 M1 的 FacePipeline Protocol——评估只是另一个调用方
-from face_recognition.domain.errors import NoFaceError
+from face_recognition.domain.errors import MultipleFacesError, NoFaceError
 from face_recognition.domain.interfaces import FacePipeline
 from face_recognition.evaluation.lfw_loader import LfwImage
 from face_recognition.evaluation.types import EvalEncoding
@@ -1267,14 +1622,14 @@ def encode_image_paths(
         if img is None:
             logger.warning("无法读取图片，跳过：%s", p)
             continue
-        # M1 约定：FacePipeline.encode_single 在检测不到脸时**抛 NoFaceError**，
-        # 不是返回 None。评估侧捕获该异常并跳过——单张失败不应中断整个流水线。
-        # try/except 缩到最小范围（只包 encode_single 这一行）：
-        # 把 EvalEncoding 构造放外面，避免把它的错误也吞掉
+        # M1 约定：FacePipeline.encode_single 在检测不到脸时抛 NoFaceError；
+        # 检测到多张脸时抛 MultipleFacesError(避免误把同框路人当作目标)。
+        # 评估口径:两种异常都跳过这张照片(记 warning),单张失败不中断流水线——
+        # 私人数据集里有合影或多人路人是常态,不能让一张多脸图把整次评估搞崩。
         try:
             face = pipeline.encode_single(img)
-        except NoFaceError:
-            logger.warning("未检测到人脸，跳过：%s", p)
+        except (NoFaceError, MultipleFacesError) as e:
+            logger.warning("跳过 %s: %s", p, e)
             continue
         out.append(EvalEncoding(
             vector=face.vector,
@@ -1287,21 +1642,30 @@ def encode_image_paths(
 def encode_lfw_images(
     pipeline: FacePipeline,
     images: list[LfwImage],
+    *,
+    max_skip_ratio: float = 0.10,
 ) -> list[EvalEncoding]:
     """把 LFW 内存图片批量编码。
 
     注意：sklearn fetch_lfw_people 给的是 RGB（H, W, 3）uint8，
     InsightFace.encode_single 期望的是 BGR（OpenCV 默认）——必须转通道。
+
+    设计取舍：**单张失败安静跳过；总跳过率 > max_skip_ratio 直接抛异常**。
+    LFW 是公开数据集质量稳定，零星检测失败正常（极端姿态/低分辨率），但批量失败 = 上游有 bug
+    （例如忘了 RGB→BGR 转、传错色彩空间、模型加载错误等），评估指标会被静默污染。10% 是一个
+    经验阈值——本科项目的 LFW 50 张样本里少于 5 张失败可接受，超过就停下来排查。
     """
     out: list[EvalEncoding] = []
+    skipped = 0
     for lfw in images:
         # cv2.cvtColor(arr, cv2.COLOR_RGB2BGR) = numpy 切片 [..., ::-1] 的等价语义
         # 选 cvtColor 更显式，读代码的人一眼看出"在做色彩空间转换"
         bgr = cv2.cvtColor(lfw.image, cv2.COLOR_RGB2BGR)
         try:
             face = pipeline.encode_single(bgr)
-        except NoFaceError:
-            logger.warning("LFW 图未检测到脸，跳过：%s", lfw.person_name)
+        except (NoFaceError, MultipleFacesError) as e:
+            logger.warning("LFW 图跳过 %s: %s", lfw.person_name, e)
+            skipped += 1
             continue
         out.append(EvalEncoding(
             vector=face.vector,
@@ -1309,6 +1673,16 @@ def encode_lfw_images(
             # image_path 用伪 URI 标记来源——回溯时一眼看出是 LFW
             image_path=f"lfw://{lfw.person_name}",
         ))
+
+    # 守门：跳过率太高说明整批有系统性问题，不能让评估"用一半样本得出结论"
+    # 注意 len(images) 可能为 0（极端测试场景），用 max(...,1) 防 ZeroDivision
+    skip_ratio = skipped / max(len(images), 1)
+    if skip_ratio > max_skip_ratio:
+        raise RuntimeError(
+            f"LFW 编码跳过率过高: {skipped}/{len(images)} = {skip_ratio:.1%}, "
+            f"阈值 {max_skip_ratio:.1%}。常见原因：忘了 RGB→BGR 转换；"
+            f"InsightFace 模型加载失败；LFW 子集参数（n_persons）过小且都是难样本。"
+        )
     return out
 ```
 
@@ -1369,12 +1743,29 @@ def _unit_vec(seed: int) -> np.ndarray:
 
 
 def _make_dataset(root: Path, n_persons: int, n_imgs_per_person: int) -> None:
-    """造合成数据集：每人若干占位 jpg。embedder 会被 mock，不需要真图片。"""
+    """造合成数据集:每人若干**可解码**的 jpg。
+
+    embedder 调用 `cv2.imread()`,b"fake" 字节会让它返回 None 然后被静默跳过——
+    测试虽然过但根本没走通主流程(假阴性)。这里写一张 10×10 黑图保证 imread 成功;
+    像素内容无关紧要,因为下面 fake_pipeline.encode_single 是 mock 的不看像素。
+    """
+    import cv2
+
     for i in range(n_persons):
         d = root / f"person_{i:02d}"
         d.mkdir()
         for j in range(n_imgs_per_person):
-            (d / f"{j:03d}.jpg").write_bytes(b"fake")
+            # 每张图的像素**必须不同**,否则下面 fake_encode 用 img.tobytes() 算
+            # seed 时所有图都映射到同一向量,所有 train/test 配对都成 genuine,
+            # 评估流水线虽然跑完但完全没意义。这里把 (person_idx, image_idx)
+            # 编码到第一个像素保证唯一。
+            #
+            # 用 .png 而非 .jpg:JPEG 是有损压缩,10×10 图上一像素的微小差异在
+            # 解码后很可能被抹平。PNG 无损,差异保得住。data_split 的 _IMG_EXTS
+            # 已经包含 .png 后缀。
+            img = np.zeros((10, 10, 3), dtype=np.uint8)
+            img[0, 0] = (i, j, 1)
+            cv2.imwrite(str(d / f"{j:03d}.png"), img)
 
 
 @pytest.mark.slow
@@ -1390,10 +1781,14 @@ def test_run_ablation_produces_all_artifacts(tmp_path: Path, monkeypatch: pytest
     from face_recognition.domain.entities import FaceEncoding
 
     fake_pipeline = MagicMock()
+    fake_pipeline.model_version = "buffalo_l"
 
+    # 用确定性的 seed:基于内容哈希(img 的 bytes)而不是对象 id。
+    # CPython 的 id() 在对象释放后会复用,跨运行不可复现,与项目"RANDOM_SEED=42 全局可复现"原则冲突。
+    # hash(bytes) 是稳定的(同一进程内同 bytes 同 hash;PYTHONHASHSEED 固定后跨运行也稳定)。
     def fake_encode(img):
-        # 用 id(img) 当随机种子——不同 ndarray 对象拿不同向量
-        return FaceEncoding(vector=_unit_vec(id(img) % 100000), model_version="buffalo_l")
+        seed = abs(hash(img.tobytes())) % (2**32)
+        return FaceEncoding(vector=_unit_vec(seed), model_version="buffalo_l")
 
     fake_pipeline.encode_single.side_effect = fake_encode
 
@@ -1454,6 +1849,7 @@ from face_recognition.evaluation.metrics import (
     compute_roc,
     compute_tar_at_far,
     compute_top1_accuracy,
+    compute_top1_with_threshold,
 )
 from face_recognition.evaluation.pair_generator import (
     generate_genuine_pairs,
@@ -1477,44 +1873,58 @@ def _all_strategies(seed: int) -> dict[str, TemplateStrategy]:
     }
 
 
-def _select_one_template_per_person(
+def _build_templates_per_person(
     person_id: str,
     train_encodings: list[EvalEncoding],
     strategy: TemplateStrategy,
-) -> EvalEncoding | None:
-    """跑一个策略，把训练集压缩成"代表向量"。
+    pipeline: FacePipeline,
+) -> list[EvalEncoding]:
+    """跑一个策略,把训练集映射成该人的"模板向量集"(可以是 1~N 个)。
 
-    策略可能返回 1 个（mean_all）或多个（kmeans_k3=3、all_vectors=N）Template。
-    评估指标按"每人 1 个代表向量"算 ROC——多模板的策略取平均向量再归一化作为代表。
-    这是评估侧的简化口径，**不**影响生产侧的多模板检索。
+    策略可能返回 1 个(mean_all/random_one)或多个(kmeans_k3=3、all_vectors=N)Template。
+    **评估口径**:保留多模板,scoring 时对每个 query 取 max_t cos(query, t) 作为该人得分。
+    这与生产识别(M1 RecognizeFace 的多模板矩阵 max-by-template)逻辑完全一致,
+    避免了"评估时强行平均→kmeans_k3 退化为 mean_all"的失真。
+
+    Edge case: 训练集为空 → 返回 []，调用方应跳过该人，不能让 0 模板的人混进 impostor 配对
+    （否则 cos(any_query, ∅) 在矩阵实现里是 -inf 还是 0 都是 bug——不如压根不存在）。
+
+    Edge case: 训练集 < 策略要求数（如 kmeans_k3 但只有 2 张照片）→ M1 的策略实现里
+    已有降级路径（kmeans_k3 把 < k 时直接返回所有原始 encoding；manual_three 用 [:3]
+    宽容切片），所以本函数不再二次校验，相信 strategy.build 的契约：
+        len(strategy.build(encs)) <= max(len(encs), strategy.max_templates)
     """
     if not train_encodings:
-        return None
+        # 训练集为空：上游 split 阶段保证不会发生（按人 80/20 切，每人至少 1 张训练图），
+        # 但留这层防御是因为 LFW 库外集合可能因 encode 失败被压到 0
+        logger.warning("person_id=%s 训练集为空，跳过该人模板构建", person_id)
+        return []
 
-    # M1 定义的策略接口签名（domain/interfaces.py）：
+    # M1 定义的策略接口签名(domain/interfaces.py):
     #   def build(self, encodings: list[FaceEncoding]) -> list[Template]
-    # 入参是 FaceEncoding（带 model_version），出参是 Template（带 encoding/source/created_at）。
-    # 评估侧手头是 EvalEncoding，需要先映射到 FaceEncoding 再传给策略。
+    # FaceEncoding 需要 model_version,从 pipeline 读取(不再硬编码 "buffalo_l")。
     fe_list = [
-        FaceEncoding(vector=e.vector, model_version="buffalo_l")
+        FaceEncoding(vector=e.vector, model_version=pipeline.model_version)
         for e in train_encodings
     ]
     templates = strategy.build(fe_list)
     if not templates:
-        return None
+        # 策略主动返回 0 模板：当前 5 个策略都不会发生，但接口允许；防御一下
+        logger.warning(
+            "person_id=%s 策略 %s 返回 0 模板，跳过", person_id, strategy.__class__.__name__
+        )
+        return []
 
-    # Template 里的向量在 .encoding.vector，先抽出来再聚合
-    template_vectors = [t.encoding.vector for t in templates]
-    # 多个模板向量求平均 + L2 归一化 → 单个代表向量
-    # 这是评估口径的近似；生产识别时 5 策略各自的检索逻辑由 application 层负责
-    avg = np.mean(template_vectors, axis=0)
-    avg = avg / np.linalg.norm(avg)
-    # 取第一张图的 image_path 当代表，仅用于 debug 回溯
-    return EvalEncoding(
-        vector=avg.astype(np.float32),
-        person_id=person_id,
-        image_path=train_encodings[0].image_path,
-    )
+    # 把每个 Template 包成 EvalEncoding 返回(共享同一 person_id);
+    # image_path 用第一张图占位,仅作 debug 回溯。
+    return [
+        EvalEncoding(
+            vector=t.encoding.vector.astype(np.float32),
+            person_id=person_id,
+            image_path=train_encodings[0].image_path,
+        )
+        for t in templates
+    ]
 
 
 def run_ablation(
@@ -1558,12 +1968,13 @@ def run_ablation(
 
     for name, strategy in _all_strategies(seed).items():
         logger.info("  策略：%s", name)
-        # 4.1 用策略压缩每个人 train_set → 1 个代表向量
-        templates: dict[str, EvalEncoding] = {}
+        # 4.1 用策略把每个人 train_set 压成模板向量集(可能 1~N 个);
+        # 评估全程保留多模板,scoring 用 max-similarity(见 generate_*_pairs)。
+        templates: dict[str, list[EvalEncoding]] = {}
         for pid, encs in train_encodings_per_person.items():
-            tpl = _select_one_template_per_person(pid, encs, strategy)
-            if tpl is not None:
-                templates[pid] = tpl
+            tpls = _build_templates_per_person(pid, encs, strategy, pipeline)
+            if tpls:
+                templates[pid] = tpls
 
         # 4.2 造配对：Genuine + 库外 Impostor（spec 已决定省去库内 Impostor）
         genuine = generate_genuine_pairs(test_encodings, templates)
@@ -1575,6 +1986,8 @@ def run_ablation(
         eer, eer_thresh = compute_eer(all_pairs)
         tar = compute_tar_at_far(all_pairs, target_far=target_far)
         top1 = compute_top1_accuracy(test_encodings, templates)
+        # 带阈值版本用本策略自己的 EER 阈值,衡量"端到端可用性"——见 metrics.py 注释
+        top1_thr = compute_top1_with_threshold(test_encodings, templates, threshold=eer_thresh)
         fpr, tpr, _ = compute_roc(all_pairs)
 
         all_metrics.append(StrategyMetrics(
@@ -1583,6 +1996,7 @@ def run_ablation(
             eer_threshold=eer_thresh,
             tar_at_far_1e3=tar,
             top1_accuracy=top1,
+            top1_with_threshold=top1_thr,
             roc_fpr=fpr,
             roc_tpr=tpr,
             n_genuine=len(genuine),

@@ -112,13 +112,18 @@ class InsightFacePipeline:
         """同 encode，但保留 InsightFace 的 bbox（int4 像素坐标）。"""
         # FaceAnalysis.get(img) 返回 list[Face]，每个 Face 有：
         #   - bbox: np.ndarray shape=(4,) float32 [x1, y1, x2, y2]
-        #   - normed_embedding: 已 L2 归一化的 (512,) float32
+        #   - embedding: (512,) float32 原始向量（未归一化）
+        #   - normed_embedding: 库内已归一化版本
+        # WHY 用 f.embedding 而不是 f.normed_embedding:
+        #   注册路径(encode_single)用 f.embedding + 自家 _normalize；
+        #   实时识别路径必须走同一条归一化实现，否则两路向量在浮点精度上有 ~1e-7 漂移，
+        #   极端阈值附近会导致同一张脸"注册时是 self,识别时变 unknown"的诡异 bug。
         faces = self._app.get(image)
         out: list[DetectedFace] = []
         for f in faces:
             x1, y1, x2, y2 = f.bbox.astype(int).tolist()
             enc = FaceEncoding(
-                vector=self._normalize(f.normed_embedding),
+                vector=self._normalize(f.embedding.astype(np.float32)),
                 model_version=self._model_pack,
             )
             out.append(DetectedFace(bbox=(x1, y1, x2, y2), encoding=enc))
@@ -230,13 +235,15 @@ def test_recognized_track_keeps_identity_across_frames():
     """识别完后调用 set_identity；后续帧应继承 identity 且 needs_recognition=False。"""
     tracker = IoUTracker(iou_threshold=0.5)
     [t1] = tracker.update([(10, 10, 110, 110)])
-    tracker.set_identity(t1.track_id, person_id="alice", similarity=0.82)
+    # frame_idx=0：当前是第 0 帧时识别完成；后续帧靠帧号差判断"是否到了重识别周期"
+    tracker.set_identity(t1.track_id, person_id="alice", similarity=0.82, frame_idx=0)
 
     [t2] = tracker.update([(12, 12, 112, 112)])
     assert t2.track_id == t1.track_id
     assert t2.identity == "alice"
     assert t2.similarity == 0.82
     assert t2.needs_recognition is False
+    assert t2.last_recognition_frame == 0
 
 
 def test_track_disappears_after_max_missing_frames():
@@ -287,6 +294,20 @@ class Track:
     needs_recognition: bool = True
     # 用来超时清理：每帧 +1，被匹配上重置为 0；超过 max_missing_frames 就被删
     missing_frames: int = 0
+    # 上次跑识别时的帧号。
+    # ── 给新手的 3 个常见疑问 ──
+    #  Q1: 为什么用 -1 不用 None?
+    #     A: 后面要算 (当前帧号 - last_recognition_frame) 看"距上次识别多久了"。
+    #        如果用 None，每次都得写 if x is None：判断；用 -1 当哨兵（sentinel），
+    #        第 0 帧时算出来 0 - (-1) = 1 帧，照样能进入"该识别"的分支，省一个分支。
+    #  Q2: 为什么不用 0?
+    #     A: 0 是合法帧号（第 0 帧）。如果初值就是 0，第 0 帧入镜的新 track 会被误判
+    #        为"刚刚已识别过"。-1 在帧号取值范围外，专门表示"还没发生过"。
+    #  Q3: 这个字段是干嘛用的（业务上）?
+    #     A: 实时识别要做"每 N 帧重识别一次"——为什么要重识别：
+    #         (1) 第一次入镜可能是侧脸/逆光被判 unknown，正脸时再给一次机会
+    #         (2) 一个 track 连续命中很久，模板可能已悄悄被删/换 → 防止永久缓存
+    last_recognition_frame: int = -1
 
 
 def _iou(box_a: BBox, box_b: BBox) -> float:
@@ -295,6 +316,25 @@ def _iou(box_a: BBox, box_b: BBox) -> float:
       - 交集面积：x 方向重叠长度 × y 方向重叠长度（任一方向 ≤ 0 则面积 0）
       - 并集面积：A 面积 + B 面积 − 交集
       - IoU = 交 / 并，范围 [0, 1]
+
+    ── 给小白：拿一组真实数字走一遍 ──
+        A = (0, 0, 10, 10)   ← 10×10 的方块，左上角原点
+        B = (5, 5, 15, 15)   ← 10×10 的方块，向右下偏移 5
+      交集左边界 = max(0,5)=5，右边界 = min(10,15)=10 → 宽 5
+      交集上边界 = max(0,5)=5，下边界 = min(10,15)=10 → 高 5
+      交集面积 = 5 × 5 = 25
+      A 面积 = 100，B 面积 = 100
+      并集面积 = 100 + 100 - 25 = 175
+      IoU = 25 / 175 ≈ 0.143
+
+    完全不重叠的情况会怎样？比如 A=(0,0,10,10) 和 B=(20,20,30,30)：
+      min(10,30) - max(0,20) = 10 - 20 = -10 ← 负数！
+      max(-10, 0) = 0 → 交集宽度被夹到 0 → 面积 0 → IoU 0 ✓
+    `max(..., 0)` 这一句就是用来处理"完全没重叠"——没它会算出负面积，整个公式废掉。
+
+    坐标系约定：(x1, y1, x2, y2) 都是 OpenCV 图像坐标——原点在**左上角**，
+    x 向右增、**y 向下增**（和数学课的 y 轴朝上**相反**）。所以 y1 一定 < y2
+    （上 < 下），不要按数学习惯写反。
     """
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
@@ -370,14 +410,22 @@ class IoUTracker:
         # 只返回本帧实际出现的 track（missing=0）；已经"消失但尚未超时"的不渲染
         return [t for t in self._tracks.values() if t.missing_frames == 0]
 
-    def set_identity(self, track_id: int, person_id: str | None, similarity: float) -> None:
-        """识别完成后回填身份。person_id=None 表示"识别过但低于阈值"——下次不再重复识别。"""
+    def set_identity(
+        self, track_id: int, person_id: str | None, similarity: float, frame_idx: int
+    ) -> None:
+        """识别完成后回填身份。
+
+        参数 frame_idx：当前帧号，用于实现"N 帧后重识别"——上层调度器
+        会比较 (current_frame - last_recognition_frame) 是否超过 recheck_interval。
+        person_id=None 表示"识别过但低于阈值"——下次重识别窗口到了仍会再试。
+        """
         if track_id not in self._tracks:
             return  # track 已经被清理（罕见但要防）；安静忽略
         t = self._tracks[track_id]
         t.identity = person_id
         t.similarity = similarity
         t.needs_recognition = False
+        t.last_recognition_frame = frame_idx
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -510,6 +558,17 @@ class CameraCapture:
         ret, frame = self._cap.read()
         if not ret or frame is None:
             raise CameraDisconnectedError("摄像头读取失败")
+        # ── 给小白：frame 的颜色顺序是 BGR，不是 RGB（OpenCV 最大的坑） ──
+        # cv2.VideoCapture.read() / cv2.imread() 返回的 ndarray 形状 (H, W, 3) uint8，
+        # 但**通道顺序是 BGR**（蓝-绿-红），不是新手熟悉的 RGB。这是 OpenCV 1999 年
+        # 那版作者遗留的历史习惯，沿用至今。
+        # 后果：
+        #   - 直接喂 InsightFace `app.get(frame)` ✓ 没事——InsightFace 接 BGR
+        #   - 直接喂 cv2.imencode(".jpg", frame) ✓ 没事——cv2 全家都是 BGR
+        #   - 直接喂 PIL.Image.fromarray(frame) ✗ 颜色会反（人脸变蓝紫色）
+        #   - 直接喂 matplotlib.imshow(frame) ✗ 同上
+        # 想给非 OpenCV 工具看，要先转：`cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)`。
+        # 本项目链路全在 OpenCV/InsightFace 内部转，**不需要**手动 cvtColor。
         return frame
 
     def release(self) -> None:
@@ -890,7 +949,8 @@ def test_first_frame_detects_and_recognizes():
     matrix.query.return_value = ("alice", 0.85)
 
     use_case = RecognizeFrame(pipeline=pipeline, tracker=tracker,
-                              template_matrix=matrix, threshold=0.45)
+                              template_matrix=matrix, threshold=0.45,
+                              recheck_interval=30)
 
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     tracks = use_case.process_frame(frame)
@@ -913,7 +973,8 @@ def test_below_threshold_marks_unknown():
     matrix.query.return_value = ("bob", 0.30)  # 远低于阈值 0.45
 
     use_case = RecognizeFrame(pipeline=pipeline, tracker=tracker,
-                              template_matrix=matrix, threshold=0.45)
+                              template_matrix=matrix, threshold=0.45,
+                              recheck_interval=30)
 
     tracks = use_case.process_frame(np.zeros((480, 640, 3), dtype=np.uint8))
 
@@ -922,7 +983,7 @@ def test_below_threshold_marks_unknown():
 
 
 def test_existing_track_skips_recognition():
-    """已识别过的 track（needs_recognition=False）下一帧不再触发 query。"""
+    """已识别过的 track（needs_recognition=False）短期内（未到重识别窗口）不再触发 query。"""
     pipeline = MagicMock()
     # 两帧都返回同一位置的脸 → IoU 高 → 同一 track
     pipeline.detect_and_encode.return_value = [_fake_face((10, 10, 50, 50))]
@@ -930,14 +991,47 @@ def test_existing_track_skips_recognition():
     matrix = MagicMock()
     matrix.query.return_value = ("alice", 0.85)
 
+    # recheck_interval 设大数：保证 2 帧内不会触发重识别
     use_case = RecognizeFrame(pipeline=pipeline, tracker=tracker,
-                              template_matrix=matrix, threshold=0.45)
+                              template_matrix=matrix, threshold=0.45,
+                              recheck_interval=10_000)
 
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     use_case.process_frame(frame)  # 第一帧：识别一次
     use_case.process_frame(frame)  # 第二帧：同一 track，不再识别
 
     assert matrix.query.call_count == 1
+
+
+def test_track_re_recognizes_after_recheck_interval():
+    """已识别的 track 经过 N 帧后应重新识别一次——
+    用例：第一帧侧脸被判 unknown，正脸后再给一次机会。
+    本测试用 recheck_interval=3 让逻辑在小帧数内可观察。"""
+    pipeline = MagicMock()
+    pipeline.detect_and_encode.return_value = [_fake_face((10, 10, 50, 50))]
+    tracker = IoUTracker(iou_threshold=0.5)
+    matrix = MagicMock()
+    # 第一次识别：低分被判 unknown（identity=None）
+    # 第二次识别：高分命中 alice
+    matrix.query.side_effect = [("bob", 0.20), ("alice", 0.85)]
+
+    use_case = RecognizeFrame(pipeline=pipeline, tracker=tracker,
+                              template_matrix=matrix, threshold=0.45,
+                              recheck_interval=3)
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    # 帧 0：识别 → unknown
+    tracks = use_case.process_frame(frame)
+    assert tracks[0].identity is None
+    # 帧 1, 2：在 recheck 窗口内，跳过
+    use_case.process_frame(frame)
+    use_case.process_frame(frame)
+    assert matrix.query.call_count == 1
+    # 帧 3：达到 recheck_interval=3，重新识别 → alice
+    tracks = use_case.process_frame(frame)
+    assert matrix.query.call_count == 2
+    assert tracks[0].identity == "alice"
+    assert tracks[0].similarity == pytest.approx(0.85)
 
 
 def test_no_faces_returns_empty():
@@ -948,7 +1042,8 @@ def test_no_faces_returns_empty():
     matrix = MagicMock()
 
     use_case = RecognizeFrame(pipeline=pipeline, tracker=tracker,
-                              template_matrix=matrix, threshold=0.45)
+                              template_matrix=matrix, threshold=0.45,
+                              recheck_interval=30)
 
     tracks = use_case.process_frame(np.zeros((480, 640, 3), dtype=np.uint8))
 
@@ -962,7 +1057,7 @@ def test_no_faces_returns_empty():
 uv run pytest tests/unit/application/test_recognize_frame.py -v
 ```
 
-预期：4 个测试全部 FAIL（ImportError，因为模块还没建）
+预期：5 个测试全部 FAIL（ImportError，因为模块还没建）
 
 - [ ] **Step 3: 写实现**
 
@@ -992,7 +1087,8 @@ class RecognizeFrame:
     这是 Python 3.10+ 的常用模式，省掉重复模板代码。
 
     使用方式（在 api/server.py 的识别线程里）：
-        use_case = RecognizeFrame(pipeline=..., tracker=..., template_matrix=..., threshold=0.45)
+        use_case = RecognizeFrame(pipeline=..., tracker=..., template_matrix=...,
+                                  threshold=0.45, recheck_interval=30)
         while True:
             frame = capture.read()
             tracks = use_case.process_frame(frame)
@@ -1002,6 +1098,23 @@ class RecognizeFrame:
     tracker: IoUTracker
     template_matrix: TemplateMatrixService
     threshold: float
+    # 已识别 track 经过多少帧后强制重识别一次。
+    # 默认 30：30fps 摄像头下约 1 秒——首次入镜被判 unknown，1 秒后正脸再给一次机会。
+    # 设大数（如 10_000）= 实际禁用重识别，等同旧行为；设 1 = 每帧都识别（CPU 打满）。
+    recheck_interval: int = 30
+    # 内部帧计数器：每次 process_frame 调用一次就自增 1，从 0 开始数。
+    # ── 给新手解释三个细节 ──
+    #  (1) 为什么放在 dataclass 字段里而不是写一个全局变量 `frame_counter = 0`？
+    #      全局变量 = 整个 Python 进程共享一份。如果以后同时跑两路视频流（一路实时
+    #      摄像头 + 一路回放离线视频），它们会共用同一个计数器、互相干扰。
+    #      把它放进 dataclass 字段 = 每个 RecognizeFrame 实例各有一份，互不污染。
+    #      这是 OOP 里"封装状态"的小例子。
+    #  (2) 名字前面的下划线 `_` 是 Python 约定："这是内部状态，外部别碰"。
+    #      不是强制的（Python 没有 private），但读到 `_frame_counter` 的人就知道
+    #      "我不该在外部改它"。
+    #  (3) `: int = 0` 是类型注解 + 默认值。dataclass 会自动把它变成
+    #      __init__ 的参数，`RecognizeFrame(...)` 不传它时默认 0。
+    _frame_counter: int = 0
 
     def process_frame(self, frame: np.ndarray) -> list[Track]:
         """处理一帧画面，返回更新后的所有 tracks。
@@ -1009,12 +1122,19 @@ class RecognizeFrame:
         流程：
             1. pipeline 检测 + 编码（一站式）→ 拿到 list[DetectedFace]
             2. 提取 bbox → 喂给 tracker.update → 拿到 tracks（含 needs_recognition 标记）
-            3. 对每个 needs_recognition=True 的 track，找到对应 face、查 matrix、判阈值
-            4. tracker.set_identity 写回结果
+            3. 对每个"需要识别"的 track（首次出现 OR 距上次识别超过 recheck_interval 帧），
+               找到对应 face、查 matrix、判阈值
+            4. tracker.set_identity 写回结果（同时记录当前帧号）
 
         为什么"按需识别"而不是每帧都识别：
             ResNet100 编码一次 ~10ms，如果每帧都识别每个脸，3 个脸的画面 30fps
-            就是 3×10×30=900ms/秒，CPU 直接打满。跟踪命中后不再重复识别 = 省 90% 计算。
+            就是 3×10×30=900ms/秒，CPU 直接打满。跟踪命中后跳过重复识别 = 省 90% 计算。
+
+        为什么需要"N 帧后重识别"：
+            纯按 needs_recognition 标记会把 unknown 判定永久缓存——用户首次入镜恰逢
+            侧脸/逆光被打成 unknown，之后正脸面对摄像头也永远是 unknown 直到 track 消失。
+            每 N 帧（≈1 秒）强制再跑一次，给"翻盘"的机会。代价：每秒每张脸多一次推理，
+            可接受。
         """
         # 一站式调用 InsightFace：检测 + 5 关键点对齐 + 512 维向量编码
         # detect_and_encode 是 M1 Task 0 加的方法，返回 list[DetectedFace]
@@ -1025,25 +1145,34 @@ class RecognizeFrame:
         if not faces:
             # 注意：还是要让 tracker 走一遍 update（喂空 list），
             # 否则原先存在的 track 不会增加 missing_frames，永远不被清理
+            self._frame_counter += 1
             return self.tracker.update([])
 
         # 把 DetectedFace.bbox 拍扁成 tracker 要的 list[BBox]
         # bbox 是 (x1, y1, x2, y2) int 元组，与 IoUTracker 的 BBox 类型一致
         bboxes = [face.bbox for face in faces]
 
-        # tracker 一次性返回所有更新后的 tracks（含已存在和新建的）
+        # tracker 一次性返回**当前帧**激活的 tracks（已过滤 missing > 0 的过期轨迹）
         tracks = self.tracker.update(bboxes)
 
-        # bbox → face 的反查表（根据 IoU 关联，但这里偷懒用顺序：
-        # tracker.update 的实现保证返回顺序与传入 bboxes 一一对应——若实现变了这里会出 bug）
-        # 更稳妥的做法：再算一次 IoU 关联。但 35 人小项目下不必过度防御。
-        bbox_to_face = dict(zip(bboxes, faces))
+        # 用 track.bbox 做主键匹配回 face：
+        # 注意不能用 dict(zip(bboxes, faces)) ——若两张脸 bbox 完全相同(极小概率)后者覆盖前者；
+        # 也不该读 tracker._tracks 私有属性。直接遍历 faces 找 bbox 相等的项最直白。
+        bbox_to_face = {tuple(face.bbox): face for face in faces}
 
         for track in tracks:
-            if not track.needs_recognition:
-                continue  # 已识别过的 track 跳过
+            # 触发识别的两种情况：
+            #   1) 首次出现的 track（needs_recognition=True，last_recognition_frame=-1）
+            #   2) 已识别但距上次识别已超过 recheck_interval 帧——给 unknown 翻盘机会
+            frames_since_last = self._frame_counter - track.last_recognition_frame
+            should_recognize = (
+                track.needs_recognition
+                or frames_since_last >= self.recheck_interval
+            )
+            if not should_recognize:
+                continue
 
-            face = bbox_to_face.get(track.bbox)
+            face = bbox_to_face.get(tuple(track.bbox))
             if face is None:
                 continue  # 防御：理论上不会发生
 
@@ -1052,14 +1181,25 @@ class RecognizeFrame:
             person_id, similarity = self.template_matrix.query(face.encoding.vector)
 
             # 阈值判定：低于阈值 → 标为未知（identity=None）但仍记录 similarity 便于调试
+            # 注意：传入 self._frame_counter 让 tracker 记录"本次识别发生在哪一帧"，
+            # 下次进 process_frame 时根据这个值算 frames_since_last。
             if similarity < self.threshold:
-                self.tracker.set_identity(track.track_id, None, similarity)
+                self.tracker.set_identity(
+                    track.track_id, None, similarity, self._frame_counter
+                )
             else:
-                self.tracker.set_identity(track.track_id, person_id, similarity)
+                self.tracker.set_identity(
+                    track.track_id, person_id, similarity, self._frame_counter
+                )
 
-        # 重新拿一次 tracks（identity 已被 set_identity 写回）
-        # 复用 tracker._tracks 的当前快照，避免再算一遍 IoU
-        return list(self.tracker._tracks.values())
+        # 帧计数器自增——必须在所有 set_identity 调用后递增，
+        # 否则同一帧内被识别的 track，其 last_recognition_frame 会比"当前帧号"大 1，
+        # 下次 process_frame 时计算 frames_since_last 出错。
+        self._frame_counter += 1
+
+        # set_identity 直接 mutate Track 对象 → tracks 列表里持有的就是同一批引用,
+        # 已包含最新 identity。直接返回,无需再访问 tracker 内部状态。
+        return tracks
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -1068,7 +1208,7 @@ class RecognizeFrame:
 uv run pytest tests/unit/application/test_recognize_frame.py -v
 ```
 
-预期：4 passed
+预期：5 passed
 
 - [ ] **Step 5: commit**
 
@@ -1178,6 +1318,25 @@ def get_config() -> AppConfig:
     """加载 config.yaml 一次，后续调用直接返回缓存。
 
     @lru_cache(maxsize=1) 是 Python 标准库的"无参函数级单例"惯用法。
+
+    ── 给小白：lru_cache 到底在做什么 ──
+    `@lru_cache` 来自 functools，本意是"缓存最近 N 次不同参数调用的返回值"。
+    例如 `@lru_cache(maxsize=128) def fib(n): ...` 会记住最近 128 个不同的 n 对应
+    的结果，重复 n 直接返回缓存值不再重算（动态规划的常见写法）。
+    用在**无参**函数 + maxsize=1 上时，"最近 1 次"就是"唯一一次"——整个进程对
+    `get_config()` 的所有调用都拿到同一个返回值。第一次调用真正执行 `load_config()`
+    读 yaml，之后 N-1 次都是从 dict 里查表 O(1) 返回。
+    等价但更啰嗦的手写版：
+        _cfg = None
+        def get_config():
+            global _cfg
+            if _cfg is None:
+                _cfg = load_config(...)
+            return _cfg
+    `@lru_cache` 不仅写起来短，而且**线程安全**（内部加了 lock），生产里同时来 100
+    个请求第一次调用也不会重复加载。本项目的 `get_pipeline` / `get_repository` 全
+    用这一招把"全应用唯一实例"实现得极简。
+    清缓存：`get_config.cache_clear()`——测试里用来强制重新加载配置时有用。
     """
     from pathlib import Path
     return load_config(Path("config.yaml"))
@@ -1232,10 +1391,20 @@ def build_recognize_frame_use_case() -> RecognizeFrame:
         ),
         template_matrix=get_template_matrix(),
         threshold=cfg.recognition.threshold,
+        recheck_interval=cfg.realtime.recognition_recheck_interval,
     )
 ```
 
-> 注：M1 的 `config.yaml` 已含 `recognition.threshold` + `realtime.{iou_threshold, track_max_missing_frames, detect_every_n_frames, recognize_on_new_track}` + `camera.{device_index, resolution, fps}`。**M4 需要新增** `realtime.jpeg_quality: int = 80`（用于 frame_renderer）——同步在 `RealtimeConfig` BaseModel 加 `jpeg_quality: int = Field(default=80, ge=1, le=100)`，并在 config.yaml 的 realtime 段加一行。
+> 注：M1 的 `config.yaml` 已含 `recognition.threshold` + `realtime.{iou_threshold, track_max_missing_frames, detect_every_n_frames, recognize_on_new_track}` + `camera.{device_index, resolution, fps}`。**M4 需要新增两项**：
+> 1. `realtime.jpeg_quality: int = 80`（用于 frame_renderer）
+> 2. `realtime.recognition_recheck_interval: int = 30`（30fps 下约 1 秒；用于"unknown 翻盘机会"——见 Task 5 RecognizeFrame）
+>
+> 同步在 `RealtimeConfig` BaseModel 加：
+> ```python
+> jpeg_quality: int = Field(default=80, ge=1, le=100)
+> recognition_recheck_interval: int = Field(default=30, ge=1, le=10_000)
+> ```
+> 并在 config.yaml 的 realtime 段加对应两行。
 
 - [ ] **Step 4: 写 server.py 骨架**
 
@@ -1272,6 +1441,25 @@ async def lifespan(app: FastAPI):
     把一个 async generator 转换为 async with 可用的上下文管理器。
 
     yield 之前 = 启动；yield 之后 = 关闭。
+
+    ── 给小白：拆开看四个新概念 ──
+    1) **generator（普通生成器）**：函数体里有 `yield` 就是生成器。调用它不立刻执行，
+       而是返回一个迭代器；每次 `next()` 跑到下一个 yield 就暂停。
+    2) **async generator（异步生成器）**：`async def` + `yield`，调用得到异步迭代器。
+       适合"边跑异步任务边吐结果"的场景（这里我们只 yield 一次，纯当上下文用）。
+    3) **context manager（上下文管理器）**：实现了 `__enter__/__exit__` 的对象，
+       配合 `with x as y:` 用——进入时跑 enter、退出时跑 exit（即使有异常也跑）。
+       `@contextlib.contextmanager` 把 `yield` 函数变成上下文管理器：yield 之前 =
+       enter、之后 = exit。
+    4) **`@asynccontextmanager`** = 上面那个的 async 版本，配合 `async with` 用。
+
+    FastAPI 启动时内部跑：
+        async with lifespan(app):
+            # framework 在此期间处理所有 HTTP/WebSocket 请求
+            await server.serve()
+    所以 yield **之前**的代码在"开始服务前"跑（加载模型、热模板矩阵），yield
+    **之后**的代码在"服务停止时"跑（清理资源）。yield 不带值是因为 lifespan 不
+    需要把对象交给 `as 变量` 用。
     """
     # ----- 启动逻辑 -----
     logger.info("正在加载配置...")
@@ -1431,15 +1619,18 @@ def client_with_data(tmp_path, monkeypatch):
 
 
 def test_list_persons_empty(tmp_path):
+    # 直接 try/finally:即使 assert 失败也保证 dependency_overrides 被清理。
+    # 不清理会污染后续测试(被这条测试的 repo 截胡)。
     from face_recognition.infrastructure.sqlite_repository import SqliteRepository
     repo = SqliteRepository(tmp_path / "empty.db")
     app.dependency_overrides[get_repository] = lambda: repo
-    with TestClient(app) as c:
-        response = c.get("/api/persons")
-    app.dependency_overrides.clear()
-
-    assert response.status_code == 200
-    assert response.json() == []
+    try:
+        with TestClient(app) as c:
+            response = c.get("/api/persons")
+        assert response.status_code == 200
+        assert response.json() == []
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_list_persons_returns_two(client_with_data):
@@ -1510,6 +1701,23 @@ class PersonResponse(BaseModel):
 @router.get("", response_model=list[PersonResponse])
 def list_persons(repository: PersonRepository = Depends(get_repository)) -> list[PersonResponse]:
     """列出库内所有人。
+
+    ── 给小白：`Depends(get_repository)` 是什么魔法 ──
+    `repository: PersonRepository = Depends(get_repository)` 在告诉 FastAPI：
+        "请求进来时，先帮我调用 get_repository() 一下，把它的返回值塞进 repository
+         这个形参，再调我这个函数。"
+    这就是**依赖注入（DI）**。好处有三：
+      (1) 路由函数不用自己写 `repo = SqliteRepository(...)`——脏活给 DI 容器干，
+          逻辑代码保持纯净。
+      (2) 测试时一行代码切换实现：
+              app.dependency_overrides[get_repository] = lambda: fake_repo
+          整个 app 里所有 `Depends(get_repository)` 都自动改用 fake，不需要改业务
+          代码、不需要 monkeypatch、不需要环境变量。测试结束 `.clear()` 还原。
+      (3) 依赖可以嵌套依赖：`get_repository` 内部 `Depends(get_config)`，FastAPI
+          按拓扑序自动解析；同一请求生命周期内同一 Depends 只调用一次（带缓存）。
+    形参默认值 `= Depends(...)` 不是 Python 常规默认参数——FastAPI 在路由注册时
+    扫描签名，看到 Depends 实例就走 DI 路径，普通调用方根本不会走到这个默认值。
+    """
 
     response_model=list[PersonResponse] 让 FastAPI 知道：
         - 自动把返回值校验/序列化为这个 schema
@@ -1614,14 +1822,14 @@ def test_register_person_unknown_strategy_returns_400(client_with_data):
     assert "strategy" in response.json()["detail"].lower()
 
 
-# 注：真正的 happy path 测试需要 InsightFace 模型 + GPU，
-# 放进 @pytest.mark.gpu 标记里，CI 上跳过，本地手动跑。
-@pytest.mark.gpu
+# 注：真正的 happy path 测试需要 InsightFace 模型（CPU 也能跑，但要下权重 + 较慢），
+# 放进 @pytest.mark.integration 标记里，CI 上跳过，本地手动跑。
+@pytest.mark.integration
 def test_register_person_happy_path(client_with_data):
     """真实流程冒烟：上传 1 张 InsightFace sample 图，注册成功。
 
-    @pytest.mark.gpu 是自定义标记（在 pyproject.toml 的 pytest 配置里声明），
-    `pytest -m gpu` 才跑这个测试，默认 `pytest` 跳过。
+    @pytest.mark.integration 是自定义标记（在 pyproject.toml 的 pytest 配置里声明），
+    `pytest -m integration` 才跑这个测试，默认 `pytest` 跳过。
     """
     import insightface
     from pathlib import Path
@@ -1659,7 +1867,6 @@ from fastapi import File, Form, HTTPException, UploadFile
 import numpy as np
 import cv2
 
-import cv2
 from face_recognition.application.register_face import RegisterFace
 from face_recognition.api.dependencies import (
     get_pipeline,
@@ -1668,12 +1875,9 @@ from face_recognition.api.dependencies import (
 )
 # build_strategy 是 M1 已有的工厂函数：name → 策略实例
 from face_recognition.api.dependencies import build_strategy
-from face_recognition.domain.errors import (
-    NoFaceError,
-    MultipleFacesError,
-    PersonHasNoTemplatesError,
-    DuplicatePersonError,
-)
+# 注：这里不 import 各个 domain 异常类——它们在 Task 12 的全局 exception_handler 里
+# 集中处理（FaceRecognitionError → 状态码映射）。本文件只在路径参数 / strategy 校验
+# 等"边界输入"层面用 HTTPException 自己抛 400/422，让职责分明。
 
 logger = logging.getLogger(__name__)
 
@@ -1701,6 +1905,35 @@ async def register_person(
     multipart/form-data 同时含表单字段 + 文件 → 文本字段用 Form，images 用 File。
 
     person_id 必须是 [a-zA-Z0-9_-]+：因为它会作为 URL 路径参数（DELETE / templates 端点）。
+
+    ── 给小白：拆开看 `Annotated` + `Form` + multipart 的全套机制 ──
+    1) **Annotated[T, ...]**（PEP 593，Python 3.9+）的语法是"类型 T + 任意元数据"。
+       本身只是把元数据挂在类型上，不影响运行——但工具（FastAPI、Pydantic）会读
+       这些元数据。`Annotated[str, Form(...)]` 就是在告诉 FastAPI："这个参数是
+       str，并且来自表单（不是 query string、不是 JSON 体）"。
+    2) **Form() / File() / Query() / Path() / Body()**：FastAPI 的 5 种来源标记。
+       看到 Form 就从 multipart 表单字段取，看到 File 就当二进制文件取。括号里
+       可加校验：`Form(min_length=1, pattern=r"...")` 失败时 FastAPI 自动返回
+       422 Unprocessable Entity，不进入函数体——所以函数里不用再判空。
+    3) **multipart/form-data 协议**：HTTP 上传文件用的请求体格式。请求体被一个
+       随机 boundary 字符串切成多段，每段一个字段：
+           --abc123
+           Content-Disposition: form-data; name="person_id"
+
+           alice
+           --abc123
+           Content-Disposition: form-data; name="images"; filename="1.jpg"
+           Content-Type: image/jpeg
+
+           <二进制 jpeg 字节>
+           --abc123--
+       前端 `new FormData()` + `fetch(...)` 会自动用 multipart 编码；FastAPI 看到
+       请求头 `Content-Type: multipart/form-data; boundary=abc123` 就按 boundary
+       拆段，按 `name=` 分发到对应形参。
+    4) **为什么前端不能手动设 Content-Type**：boundary 是 FormData 编码时随机
+       生成的，和 body 里用的必须一致；手动 `headers: {"Content-Type":
+       "multipart/form-data"}` 不带 boundary，后端解析直接 400。规则：传
+       FormData 时**完全不要碰 headers**，让 fetch 自动算。
     """
     # ----- 1. 参数校验 -----
     if strategy not in _VALID_STRATEGIES:
@@ -1730,12 +1963,17 @@ async def register_person(
     # build_strategy 来自 M1 dependencies.py：name + seed → TemplateStrategy 实例
     strategy_obj = build_strategy(strategy, seed=cfg.evaluation.random_seed)
     # RegisterFace 的 image_loader 这里用不到（我们直接传内存帧给 register_from_frames）,
-    # 用 lambda 占位即可。
+    # 用普通函数占位:如果有人误调用了走文件加载的旧路径,立即抛异常暴露 bug。
+    # 注意:lambda + (生成器表达式).throw(...) 看似抛异常,实际只返回生成器对象不会执行 throw,
+    # 是个静默陷阱——必须用 def 函数体里的 raise 才会真正抛出。
+    def _no_image_loader(_path):
+        raise NotImplementedError("HTTP 路径不走文件加载,应调用 register_from_frames")
+
     use_case = RegisterFace(
         pipeline=pipeline,
         repository=repository,
         strategy=strategy_obj,
-        image_loader=lambda _p: (_ for _ in ()).throw(NotImplementedError("HTTP 路径不走文件加载")),
+        image_loader=_no_image_loader,
     )
     try:
         # register_from_frames 是 M4 Task 0 给 M1 RegisterFace 加的方法：
@@ -1745,12 +1983,10 @@ async def register_person(
             display_name=display_name,
             frames=frames,
         )
-    except (NoFaceError, MultipleFacesError, PersonHasNoTemplatesError) as e:
-        # 这几个 domain 异常都会被 Task 12 的全局 handler 捕获并转为 4xx，
-        # 这里其实可以不写 try/except——但显式 catch 让本端点意图更清楚。
-        raise HTTPException(status_code=400, detail=str(e))
-    except DuplicatePersonError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+    # 注意：这里**不**捕获 NoFaceError / MultipleFacesError / PersonHasNoTemplatesError /
+    # DuplicatePersonError——它们都是 FaceRecognitionError 的子类，由 Task 12 在 server.py 注册
+    # 的全局 exception_handler 统一翻译成对应的 HTTP 状态码（422/422/422/409）。
+    # 在这里再写一遍 try/except 是重复逻辑：状态码会和全局映射不一致时悄悄出 bug。
 
     # ----- 4. 触发模板矩阵 reload，让新人立即生效 -----
     # 不 reload 的话，正在跑的 WebSocket 识别线程不会知道新人加了
@@ -1767,18 +2003,18 @@ async def register_person(
     )
 ```
 
-- [ ] **Step 4: 跑测试确认通过（非 GPU 部分）**
+- [ ] **Step 4: 跑测试确认通过（非 integration 部分）**
 
 ```bash
-uv run pytest tests/integration/api/test_routes_persons.py -v -m "not gpu"
+uv run pytest tests/integration/api/test_routes_persons.py -v -m "not integration"
 ```
 
-预期：4 passed（list 2 个 + 校验 2 个），1 个 skipped（GPU 标记）
+预期：4 passed（list 2 个 + 校验 2 个），1 个 skipped（integration 标记）
 
-- [ ] **Step 5: 手动 GPU 冒烟测试**
+- [ ] **Step 5: 手动集成冒烟测试**
 
 ```bash
-uv run pytest tests/integration/api/test_routes_persons.py::test_register_person_happy_path -v -m gpu
+uv run pytest tests/integration/api/test_routes_persons.py::test_register_person_happy_path -v -m integration
 ```
 
 预期：1 passed
@@ -1856,7 +2092,7 @@ def delete_person(
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-uv run pytest tests/integration/api/test_routes_persons.py -v -m "not gpu"
+uv run pytest tests/integration/api/test_routes_persons.py -v -m "not integration"
 ```
 
 预期：6 passed
@@ -1941,7 +2177,7 @@ def get_templates(
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-uv run pytest tests/integration/api/test_routes_persons.py -v -m "not gpu"
+uv run pytest tests/integration/api/test_routes_persons.py -v -m "not integration"
 ```
 
 预期：9 passed
@@ -2087,6 +2323,31 @@ def _recognition_loop(
 
     每帧产出：(jpeg_bytes, metadata_dict)
     丢进 queue 给 async 任务；满了就丢老的（防止前端慢导致延迟堆积）。
+
+    ── 给小白：threading 三件套 ──
+    Q1: `out_queue: queue.Queue` 是什么？
+        Python 标准库的**线程安全 FIFO 队列**——多线程同时 put/get 不会乱。内部已加
+        锁，调用者不需要自己上锁。常用方法：
+          - `q.put(item)` / `q.get()`：满或空时**阻塞**等待
+          - `q.put_nowait(item)` / `q.get_nowait()`：满或空时**立即抛**
+            `queue.Full` / `queue.Empty`，不阻塞
+          - `q.qsize()`：当前元素数（多线程下只是估计值）
+        本项目识别线程把 (jpeg, meta) 放进队列，async ws 任务从队列拿出来推给浏览器。
+        `maxsize=2` 限制缓冲深度——超过就丢老帧（见下方 except queue.Full 块），避免
+        前端慢导致老帧堆积、延迟越来越大。
+    Q2: `stop_event: threading.Event` 是什么？
+        跨线程的**布尔信号灯**，三件套：
+          - `event.set()`：点亮（标记为 True）
+          - `event.clear()`：熄灭
+          - `event.is_set()`：查状态（线程安全）
+          - `event.wait(timeout)`：阻塞等到点亮，可设超时
+        线程主循环写 `while not stop_event.is_set(): ...` 是**优雅退出**的标准模式：
+        外部线程在合适时机 `set()` 一下，本线程跑完当前帧后自然退出，比 `thread._stop()`
+        硬杀线程安全得多（硬杀可能让 cv2/InsightFace 留下半释放的 GPU 资源）。
+    Q3: 为什么不用 asyncio.Queue？
+        识别这一侧是**同步**世界（cv2/InsightFace 是同步阻塞 API），asyncio.Queue 必须
+        在事件循环里用。queue.Queue 同步 + 线程安全，正好桥接"同步识别线程"和"async
+        ws 任务"——具体桥接见下方 `run_in_executor` 注释。
     """
     frame_id = 0
     while not stop_event.is_set():
@@ -2129,7 +2390,11 @@ def _recognition_loop(
             except queue.Full:
                 pass  # 还是放不下就放弃这帧
 
-    capture.release()
+    # 注意:不在线程内 release。理由:
+    #   stop_event.set() 由 ws handler 触发,此时本线程可能阻塞在 capture.read() 上,
+    #   不会立刻看到 stop_event。让 ws handler 的 finally 先 release(OpenCV 容忍线程内
+    #   read() 的最后一次失败),再 join 等线程退出 → 摄像头句柄能被立即归还,
+    #   下次连 WS 时 VideoCapture(0).isOpened() 才会真。
     logger.info("识别线程退出")
 
 
@@ -2137,10 +2402,33 @@ def _recognition_loop(
 async def stream_recognition(websocket: WebSocket) -> None:
     """实时识别 WebSocket。
 
-    协议：服务端单向推送
-        - 二进制帧：JPEG 编码的渲染图
+    ── 给零基础读者的 WebSocket 速成 ──
+        WebSocket 是浏览器和服务器之间的"长连接管道"——HTTP 请求是"问一句答一句"
+        然后断开，WebSocket 是"接通后双方都能随时往里塞消息"。本项目用它的原因：
+        服务器要持续把摄像头画面（每秒几十帧）推给浏览器，HTTP 频繁建连断连开销
+        太大；WebSocket 一次握手后就常驻连接，推送几乎零延迟。
+
+        每条消息可以是文本（字符串/JSON）或二进制（bytes，比如 JPEG 字节流）。
+        WebSocket 协议**保证同一连接内消息按发送顺序到达**（底层是 TCP），
+        不会丢包也不会乱序——这是下面"先 jpeg 后 json"配对方案能成立的前提。
+
+    协议：服务端单向推送（每帧两条消息：先二进制后文本）
+        - 二进制帧：JPEG 编码的渲染图（已经画好检测框 + 名字）
         - 文本帧：JSON {"frame_id": int, "tracks": [...]}
-        每帧两条消息成对发送：先二进制后文本。
+
+        **frame_id 的作用**：客户端用来配对"画面"和"识别结果"。理论上 WebSocket
+        保证消息**有序到达**，所以"先 jpeg 后 json"挨着消费就能天然配对。但实践
+        中如果客户端 JS 处理慢、扔掉了一条消息，或开发期打断点导致接收顺序漂移，
+        没有 frame_id 就会出现"画面是第 N 帧、tracks 标的是第 N+1 帧"的错位
+        ——画面里的人脸框跟下面表格的姓名对不上号。
+        客户端拿到 jpeg 时记下"待匹配的 frame_id 应该是 last_meta + 1"，收到
+        json 后比较 frame_id：一致就配成一帧渲染，不一致就丢弃这一帧重新对齐。
+
+        **替代方案（更鲁棒，但带宽 +33%）**：把 jpeg 用 base64 编码塞进同一条
+        JSON：`{"frame_id": int, "tracks": [...], "jpeg_b64": "..."}` 单消息
+        发送，自然不存在配对问题。代价：base64 编码会把字节膨胀到 1.33 倍，
+        而且 JSON 解析比直接 Blob 解码慢。本项目 35 人小流量，二进制+文本方案
+        更省带宽，所以选它；高频/远程场景应优先单消息方案。
 
     客户端：连上即开始接收，断开即停止。
     """
@@ -2167,10 +2455,28 @@ async def stream_recognition(websocket: WebSocket) -> None:
         )
         thread.start()
 
-        loop = asyncio.get_event_loop()
+        # asyncio.get_event_loop() 在 Python 3.12+ 已 deprecated;
+        # 在协程内部应该用 get_running_loop()——它要求"当前必须有运行中的 loop",
+        # 调用上下文不对会立刻抛错,而不是悄悄新建一个空 loop 留下定时炸弹。
+        loop = asyncio.get_running_loop()
         while True:
-            # queue.get 是阻塞调用 → 在 executor 里跑避免阻塞 asyncio
-            # run_in_executor(None, ...) = 用默认线程池跑同步函数
+            # ── 给小白：为什么必须 run_in_executor，不能直接 out_queue.get() ──
+            # asyncio 事件循环是**单线程**的——所有协程在一个 OS 线程里轮转。只要任
+            # 何一处**同步阻塞**（time.sleep / queue.get / 同步 IO），整个事件循环
+            # 卡住，所有 ws 连接都失去响应，新请求也无法处理。
+            # `out_queue.get()` 是**同步阻塞** API（队列空时阻塞等待），如果直接调，
+            # ws 任务会冻结整个 server。
+            # `loop.run_in_executor(executor, fn)` 把 fn 丢给**线程池**跑，并返回一
+            # 个 awaitable。我们 `await` 它时事件循环可以去服务别的连接，等线程池
+            # 跑完 fn 再回到这里继续。
+            #   - 第一个参数 `None` = 用 asyncio 默认线程池（首次调用按需创建，默认
+            #     大小 = min(32, CPU核心数 + 4)）
+            #   - 第二个参数是要跑的同步函数（这里 `out_queue.get`，不要加括号——
+            #     传函数对象本身，executor 会替我们调用它）
+            # 整体数据流：
+            #   识别线程 ─[(jpeg, meta)]→ queue.Queue ─[await loop.run_in_executor(
+            #   None, queue.get)]→ ws 协程 ─[await ws.send_*]→ 浏览器
+            # 这是 asyncio + 同步 API（cv2/InsightFace）混用的标准桥接模式。
             kind, payload = await loop.run_in_executor(None, out_queue.get)
             if kind == "error":
                 await websocket.send_text(json.dumps({"error": payload}))
@@ -2184,14 +2490,21 @@ async def stream_recognition(websocket: WebSocket) -> None:
     except Exception:
         logger.exception("WebSocket 推流异常")
     finally:
+        # 关闭顺序:set stop → release capture → join thread。
+        # 先 release 摄像头能让阻塞在 read() 上的线程立刻醒过来抛错并退出循环;
+        # 否则线程会卡到下一次 read() 自然返回(可能是 1~33ms,也可能是数秒),
+        # join 超时静默吞掉的话句柄就泄漏了。
         stop_event.set()
-        if thread is not None:
-            thread.join(timeout=2.0)
         if capture is not None:
             try:
                 capture.release()
             except Exception:
-                pass
+                logger.exception("capture.release 失败")
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                # 不要再调 release,前面已经 release 过;只 log warning 暴露异常
+                logger.warning("识别线程 2s 内未退出,可能存在阻塞调用")
 ```
 
 - [ ] **Step 3: 在 server.py 注册路由（mount StaticFiles 之前）**
@@ -2250,30 +2563,44 @@ git commit -m "feat(api): WebSocket /ws/stream 实时识别推流"
 ```python
 # tests/integration/api/test_error_handling.py
 """验证 domain 异常被正确转换为 HTTP 错误响应。"""
+import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from face_recognition.api.server import app
+from face_recognition.api.server import register_exception_handlers
 from face_recognition.domain.errors import NoFaceError
 
 
-def test_no_face_error_returns_400(monkeypatch):
-    """当用例抛 NoFaceError 时,应返回 400。
+@pytest.fixture()
+def app_with_handlers() -> FastAPI:
+    """每个测试新建一个独立的 FastAPI 实例,只装 exception handler 不引入业务路由。
 
-    注：这里我们走"假装路由内部抛异常"的方式来验证 handler 注册了。
-    实际触发链路在 Task 8 的 register endpoint 里。
+    为什么不直接用 face_recognition.api.server.app:
+      - 全局 app 上挂的测试路由(/__test__/...)会污染后续测试和生产 import,
+        重新跑测试时还可能因路由重复注册报 RuntimeError。
+      - 用临时 app 实例 = 完全隔离,测完即弃。
+    register_exception_handlers(app) 是 server.py 抽出来的注册函数,见 Step 3。
     """
-    @app.get("/__test__/no_face")
+    app = FastAPI()
+    register_exception_handlers(app)
+
+    @app.get("/raises_no_face")
     def _raise():
         raise NoFaceError("没检测到人脸")
 
-    with TestClient(app) as client:
-        response = client.get("/__test__/no_face")
+    return app
 
-    assert response.status_code == 400
+
+def test_no_face_error_returns_422(app_with_handlers: FastAPI):
+    """当路由抛 NoFaceError 时,全局 handler 应映射为 422 + detail。"""
+    with TestClient(app_with_handlers) as client:
+        response = client.get("/raises_no_face")
+
+    assert response.status_code == 422
     assert response.json()["detail"] == "没检测到人脸"
 ```
 
-> 注：上面 `@app.get("/__test__/no_face")` 是测试时动态加的——这种"测试夹具路由"略 hack 但简单。也可以在 `routes_persons.py` 里删掉局部 `try/except NoFaceError` 后用真路由验证，看个人偏好。
+> 注：fixture 里调 `register_exception_handlers(app)` 而不是直接 import 全局 `app`,这是把异常处理注册逻辑从 server.py 抽成函数后的标准用法——既能给测试用临时 app,也能给真正的 server.py app 用。Step 3 的实现里把它抽成单独函数即可。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -2287,7 +2614,7 @@ uv run pytest tests/integration/api/test_error_handling.py -v
 
 ```python
 # server.py 增加：
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from face_recognition.domain.errors import (
@@ -2295,31 +2622,56 @@ from face_recognition.domain.errors import (
     NoFaceError,
     MultipleFacesError,
     PersonNotFoundError,
+    PersonHasNoTemplatesError,
+    DuplicatePersonError,
 )
 
 
 # 异常类 → HTTP 状态码的映射
-# 每个 domain 异常都对应一个明确的"客户端错误"状态码
+# - NoFaceError / MultipleFacesError: 422 Unprocessable Entity
+#   (请求格式正确,但语义上无法处理——422 是这种"上传是有效的,内容不对"的标准答复;
+#    与 spec §6.3 错误码表对齐)
+# - PersonNotFoundError: 404 Not Found
 _ERROR_STATUS_MAP = {
-    NoFaceError: 400,
-    MultipleFacesError: 400,
+    NoFaceError: 422,
+    MultipleFacesError: 422,
+    # 全部图片都失败 → 数据上无可用模板,422 同理（请求格式正确，业务上无法处理）
+    PersonHasNoTemplatesError: 422,
     PersonNotFoundError: 404,
+    # 重复 person_id：409 Conflict 是 RFC 7231 推荐
+    DuplicatePersonError: 409,
 }
 
 
-@app.exception_handler(FaceRecognitionError)
-async def domain_error_handler(request: Request, exc: FaceRecognitionError) -> JSONResponse:
-    """所有 domain 异常的统一处理。
+def register_exception_handlers(app: FastAPI) -> None:
+    """把 domain 异常 → HTTP 响应的转换逻辑挂到给定 app 上。
 
-    @app.exception_handler(ExceptionClass) 是 FastAPI 注册自定义异常 handler 的方式;
-    路由里 raise 这个异常类型(或子类)就会自动调到这里。
+    抽成函数(而非装饰器在模块顶层副作用执行)的好处:
+      - 测试可以构造临时 FastAPI() 实例,挂同一套 handler,完全隔离
+      - 真实 server.py 创建 app 后调一次本函数即可
+      - 单元测试不需要 import 模块级单例 app(避免污染)
     """
-    status_code = _ERROR_STATUS_MAP.get(type(exc), 500)
-    logger.warning("domain 异常: %s (path=%s)", exc, request.url.path)
-    return JSONResponse(
-        status_code=status_code,
-        content={"detail": str(exc)},
-    )
+    @app.exception_handler(FaceRecognitionError)
+    async def domain_error_handler(
+        request: Request, exc: FaceRecognitionError,
+    ) -> JSONResponse:
+        # 用 isinstance 而非 type(exc) 精确匹配:支持子类。
+        # 比如未来若 NoFaceError 派生出 NoFaceInTrainingError,也能命中 422 而不是落到 500。
+        status_code = next(
+            (s for cls, s in _ERROR_STATUS_MAP.items() if isinstance(exc, cls)),
+            500,
+        )
+        logger.warning("domain 异常: %s (path=%s)", exc, request.url.path)
+        return JSONResponse(
+            status_code=status_code,
+            content={"detail": str(exc)},
+        )
+
+
+# 在 server.py 创建 app 之后调用一次:
+# app = FastAPI(...)
+# register_exception_handlers(app)
+register_exception_handlers(app)
 ```
 
 > 这之后 Task 8 的 `routes_persons.py` 里的 `try/except NoFaceError` 可以删掉了——交给全局 handler。但**现在不要急着删**：M1 的实施情况未知，先确认 M1 的 errors.py 真的有 `FaceRecognitionError` 基类再删。
@@ -2355,7 +2707,7 @@ git commit -m "feat(api): 全局 domain 异常 → HTTP 错误响应映射"
 # tests/integration/api/test_e2e_smoke.py
 """端到端冒烟测试：模拟用户在网页上完整走一遍 REST 流程。
 
-需要 GPU + InsightFace 模型;打 @pytest.mark.gpu。
+需要 InsightFace 模型权重（CPU 也能跑，慢些）；打 @pytest.mark.integration。
 """
 from pathlib import Path
 import pytest
@@ -2367,7 +2719,7 @@ from face_recognition.api.dependencies import get_repository, get_template_matri
 from face_recognition.infrastructure.sqlite_repository import SqliteRepository
 
 
-@pytest.mark.gpu
+@pytest.mark.integration
 def test_register_list_delete_e2e(tmp_path):
     """完整生命周期:注册 → 列表 → 模板查询 → 删除 → 列表为空。"""
     repo = SqliteRepository(tmp_path / "e2e.db")
@@ -2375,44 +2727,47 @@ def test_register_list_delete_e2e(tmp_path):
 
     sample_jpg = Path(insightface.__file__).parent / "data" / "images" / "t1.jpg"
 
-    with TestClient(app) as client:
-        # 1. 初始为空
-        assert client.get("/api/persons").json() == []
+    # 用 try/finally 确保即使中间 assert 失败也能清理 overrides。
+    # 否则失败会把 repo 泄漏到后续测试,造成"看似无关"的连锁失败。
+    try:
+        with TestClient(app) as client:
+            # 1. 初始为空
+            assert client.get("/api/persons").json() == []
 
-        # 2. 注册
-        with sample_jpg.open("rb") as f:
-            response = client.post(
-                "/api/persons",
-                data={"person_id": "e2e", "display_name": "E2E", "strategy": "random_one"},
-                files={"images": ("t1.jpg", f, "image/jpeg")},
-            )
-        assert response.status_code == 201
-        person_id = response.json()["person_id"]
-        assert person_id == "e2e"
+            # 2. 注册
+            with sample_jpg.open("rb") as f:
+                response = client.post(
+                    "/api/persons",
+                    data={"person_id": "e2e", "display_name": "E2E", "strategy": "random_one"},
+                    files={"images": ("t1.jpg", f, "image/jpeg")},
+                )
+            assert response.status_code == 201
+            person_id = response.json()["person_id"]
+            assert person_id == "e2e"
 
-        # 3. 列表有 1 个
-        listed = client.get("/api/persons").json()
-        assert len(listed) == 1
+            # 3. 列表有 1 个
+            listed = client.get("/api/persons").json()
+            assert len(listed) == 1
 
-        # 4. 模板信息可查
-        templates = client.get(f"/api/persons/{person_id}/templates").json()
-        assert len(templates) == 1
-        assert "source" in templates[0]
-        assert "created_at" in templates[0]
+            # 4. 模板信息可查
+            templates = client.get(f"/api/persons/{person_id}/templates").json()
+            assert len(templates) == 1
+            assert "source" in templates[0]
+            assert "created_at" in templates[0]
 
-        # 5. 删除
-        assert client.delete(f"/api/persons/{person_id}").status_code == 204
+            # 5. 删除
+            assert client.delete(f"/api/persons/{person_id}").status_code == 204
 
-        # 6. 再列表为空
-        assert client.get("/api/persons").json() == []
-
-    app.dependency_overrides.clear()
+            # 6. 再列表为空
+            assert client.get("/api/persons").json() == []
+    finally:
+        app.dependency_overrides.clear()
 ```
 
 - [ ] **Step 2: 跑测试**
 
 ```bash
-uv run pytest tests/integration/api/test_e2e_smoke.py -v -m gpu
+uv run pytest tests/integration/api/test_e2e_smoke.py -v -m integration
 ```
 
 预期：1 passed

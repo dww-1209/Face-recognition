@@ -36,6 +36,13 @@
   ```
   默认存到 `~/scikit_learn_data/`。M2 `lfw_loader` 会自动找到。
 
+  > **网络与磁盘提醒**:这次下载约 **200MB**(完整 LFW 是 ~233MB, color=True 不会变更小,
+  > 只是返回 RGB 三通道而非灰度)。首次拉会挂十几分钟到半小时——
+  > 1) **要联网**,且能访问 `vis-www.cs.umass.edu`(国内经常超时——可挂代理或换镜像);
+  > 2) **磁盘**留 ~500MB(下载临时文件 + 解压);
+  > 3) 中断后重跑会断点续传,放心 Ctrl+C;
+  > 4) 不想占用户家目录可设 `SCIKIT_LEARN_DATA=/path/to/cache` 环境变量。
+
 - [ ] **A3. 跑全套消融实验**
 
   ```bash
@@ -44,7 +51,12 @@
       --output reports/m6-ablation/
   ```
   应产出 5 个策略 × {ROC 曲线 PNG, EER, TAR@FAR=1e-3, 各阈值下 FAR/FRR}。
-  时间：约 5~15 分钟（取决于 GPU）。
+
+  **预计时间**(35 人 × 60 张 = 2100 张照片 + ~500 LFW 库外人):
+  - **GPU**(RTX 3060 / Apple M1+ MPS):**5~10 分钟**——瓶颈在 buffalo_l 检测+编码 ~30ms/图
+  - **纯 CPU**(笔记本 i5/i7):**40~80 分钟**——CPU 上 buffalo_l 单图 ~500ms
+  - 第二次跑会快很多:特征向量已落库 SQLite,只需重做"组模板 + 评估"两步,不重抽特征
+  - 如果想强制 CPU(没 GPU 或 GPU 显存不够),`config.yaml` 把 `pipeline.device = "cpu"`
 
 - [ ] **A4. 数据健康度检查**
 
@@ -107,12 +119,16 @@
 
   把 A3 的实验结果填进 §3。CSV 转 Markdown 表格可以用：
   ```bash
+  # ⚠️ to_markdown 内部依赖 `tabulate` 包,pandas 不自带。先装一次:
+  uv add --dev tabulate
   uv run python -c "
   import pandas as pd
   df = pd.read_csv('reports/m6-ablation/summary.csv')
   print(df.to_markdown(index=False))
   "
   ```
+  > 如果忘了装会报 `ImportError: Missing optional dependency 'tabulate'`——按提示装即可。
+  > 也可以用 `df.to_string()` 出对齐文本,粘进 markdown 包 ` ``` ` 当代码块凑合用。
 
 - [ ] **B3. 自审清单**
 
@@ -146,13 +162,29 @@
   - 录前先彩排 1~2 次，避免现场卡壳
   - 输出 `docs/report/demo-video.mp4`（提交时压缩到 < 100MB）
 
+  > **压缩到 < 100MB 的 ffmpeg 食谱**(QuickTime 原片通常 5 分钟 ~500MB):
+  > ```bash
+  > # H.264 + CRF 28(质量良好,文件小);scale=-2:720 把高度限到 720p,宽度按比例
+  > # -2 = 自动选偶数(H.264 要求宽高都是偶数,否则报错)
+  > ffmpeg -i input.mov \
+  >        -vcodec libx264 -crf 28 -preset slow \
+  >        -vf "scale=-2:720" \
+  >        -acodec aac -b:a 96k \
+  >        docs/report/demo-video.mp4
+  > ```
+  > 如果还超 100MB:
+  > - 提高 CRF(数字越大文件越小,画质越糊)——CRF 30~32 仍可看清画面
+  > - 改 `scale=-2:480` 进一步缩到 480p
+  > - 或裁剪开头/结尾静止段:`-ss 00:00:05 -to 00:04:30`(从第 5 秒到 4 分 30 秒)
+  > 没装 ffmpeg:`brew install ffmpeg`(macOS)。
+
 ---
 
 ### D. 仓库清理
 
 - [ ] **D1. 检查 .gitignore 完整**
 
-  必须包含：
+  必须包含:
   ```
   data/
   *.db
@@ -162,8 +194,37 @@
   reports/*
   !reports/.gitkeep
   logs/
+  *.local.yaml
+  *.mp4
+  docs/screenshots/m5/raw/
   CLAUDE.md
   ```
+
+  > **CLAUDE.md 不入仓**——这是用户的本地 AI 协作指令，不属于项目交付物。
+  > 任何在仓库工作的 AI 助手会自动加载本地的 CLAUDE.md（Claude Code 的机制），
+  > 不需要走 git 分发。
+  >
+  > 新增项解释:
+  > - `*.local.yaml`:本地覆盖配置(开发者临时改阈值/模型路径)。`config.yaml`
+  >   主配置入仓,本地变体不入仓。
+  > - `*.mp4`:M6 录的演示视频通常 50~100MB,不适合走 git;若必须分发用 release
+  >   附件或外链。
+  > - `docs/screenshots/m5/raw/`:M5 截图未脱敏原图(含真人脸),只允许保留在本
+  >   地;脱敏后的发布版放在 `docs/screenshots/m5/` 根目录,可入仓。
+
+  > **⚠️ 已 tracked 文件不会被新增的 .gitignore 规则忽略**——`.gitignore` 只对**未 tracked**的文件生效。
+  > 比如 `CLAUDE.md` 之前已经被 `git add` 过(历史 commit 里有),那即使现在加进 .gitignore,
+  > git status 仍会跟踪它的修改。需要先**从索引移除**(保留磁盘文件):
+  > ```bash
+  > # 检查哪些文件已 tracked 但应当 ignore
+  > git ls-files | grep -E "^(CLAUDE\.md|.*\.local\.yaml|.*\.mp4|data/)"
+  >
+  > # 从 git 索引删除但保留本地文件(--cached 关键)
+  > git rm --cached CLAUDE.md
+  > git rm --cached -r data/  # 若误入仓
+  > git commit -m "chore: untrack files now in gitignore"
+  > ```
+  > 不带 `--cached` 会**真的删本地文件**——切记。
 
 - [ ] **D2. 检查没有泄露**
 
@@ -190,22 +251,52 @@
 - [ ] **D4. 跑全套测试最后一遍**
 
   ```bash
-  uv run pytest                       # 默认所有非 GPU 测试
-  uv run pytest -m gpu                # GPU 集成测试
+  uv run pytest                            # 默认：单元测试（毫秒级）
+  uv run pytest -m integration             # 集成测试（真模型 + 真 SQLite，~分钟级）
   uv run mypy src/face_recognition/domain src/face_recognition/application
   uv run ruff check .
   ```
+
+  > **marker 命名说明**：M1~M5 历史代码可能写过 `@pytest.mark.gpu`——但实际我们的集成测试在 CPU
+  > 上也能跑（`ctx_id=-1` 强制 CPU），名字误导。统一改用 `integration`。
+  > 自检：`grep -rn "pytest.mark.gpu\|pytest -m gpu" src tests docs` 应当无结果；如有，统一替换为 `integration`。
+  > `pyproject.toml` 的 `[tool.pytest.ini_options].markers` 应包含：
+  > ```toml
+  > markers = [
+  >     "integration: 集成测试（真模型 + 真 SQLite，需要本地下载的 buffalo_l 权重；跑 -m integration）",
+  >     "slow: 耗时 > 1 秒的测试",
+  > ]
+  > ```
+  > 如旧版还留着 `"gpu: ..."` 这一行，删除（`--strict-markers` 下未注册标记会报错——这正好帮我们抓漏网之鱼）。
 
   全绿才打 release tag。
 
 - [ ] **D5. 打 final tag**
 
   ```bash
+  # 1) 先确认远端配置 + 本地领先关系
+  git remote -v                          # 应看到 origin → 你的 GitHub 仓库 URL
+  git status                             # 工作区干净(或只剩 D2 中允许的文件)
+  git log origin/main..HEAD --oneline    # 看本地领先了哪些 commit;空 = 已同步
+
+  # 2) 提交 + 打 tag(顺序重要:先 commit 再 tag,否则 tag 会指向旧 commit)
   git add -A
   git commit -m "chore: M6 final cleanup + report"
-  git tag v1.0.0
-  git push origin main --tags
+  git tag -a v1.0.0 -m "Release v1.0.0: ArcFace 人脸识别系统(本科期末项目)"
+  #  ↑ -a 创建带说明的 annotated tag(推荐),纯 `git tag v1.0.0` 是 lightweight tag
+
+  # 3) 推送(必须分两步,或用 --follow-tags 一次推)
+  git push origin main                   # 推 commit
+  git push origin v1.0.0                 # 推 tag(默认 push 不带 tag,得显式)
+  # 等价单行:git push --follow-tags origin main
   ```
+
+  > **如果 push 被拒绝**(`! [rejected]` 或 `non-fast-forward`):说明远端有你本地没有的 commit。
+  > **不要直接 `--force`!** 先 `git pull --rebase origin main` 把远端改动拉下来再推。
+  > 只有"刚刚 force-push 完确认无误"才用 force,否则有覆盖队友工作的风险。
+  >
+  > **如果 tag 打错位置**:`git tag -d v1.0.0` 删本地, `git push origin :refs/tags/v1.0.0` 删远端,
+  > 然后重新打 + push。
 
 ---
 
