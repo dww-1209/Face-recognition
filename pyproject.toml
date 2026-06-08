@@ -32,6 +32,7 @@ dependencies = [
     # 评估报告
     "matplotlib>=3.8.0",
     "pandas>=2.2.0",
+    "python-multipart>=0.0.32",
 ]
 
 [dependency-groups]

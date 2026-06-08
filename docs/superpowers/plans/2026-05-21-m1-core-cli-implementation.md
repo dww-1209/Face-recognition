@@ -51,10 +51,10 @@
 | `src/face_recognition/infrastructure/config_loader.py` | `AppConfig` (pydantic BaseSettings) + `load_config()` | pydantic-settings, yaml |
 | `src/face_recognition/infrastructure/sqlite_repository.py` | `SqliteRepository` 实现 `PersonRepository` | sqlite3, numpy, domain |
 | `src/face_recognition/infrastructure/insightface_pipeline.py` | `InsightFacePipeline` 实现 `FacePipeline` | insightface, opencv, numpy, domain |
-| `src/face_recognition/application/strategies/base.py` | （空）只占位，5 个策略各自直接实现 `TemplateStrategy` Protocol | — |
+| `src/face_recognition/application/strategies/base.py` | `l2_normalize()` + `encodings_to_matrix()` 工具函数（5 策略共享） | numpy, domain |
 | `src/face_recognition/application/strategies/random_one.py` | `RandomOneStrategy` | random, domain |
 | `src/face_recognition/application/strategies/mean_all.py` | `MeanAllStrategy` | numpy, domain |
-| `src/face_recognition/application/strategies/manual_three.py` | `ManualThreeStrategy`（前 3 张取，简化版） | domain |
+| `src/face_recognition/application/strategies/manual_three.py` | `ManualThreeStrategy`（子文件夹分组取均值，模拟人工三分法） | domain |
 | `src/face_recognition/application/strategies/kmeans_k3.py` | `KMeansK3Strategy` | scikit-learn, numpy, domain |
 | `src/face_recognition/application/strategies/all_vectors.py` | `AllVectorsStrategy` | domain |
 | `src/face_recognition/application/register_face.py` | `RegisterFace` 用例 | domain, strategies, infrastructure (注入) |
@@ -81,9 +81,104 @@ tests/
 
 ---
 
-## 任务清单（13 个）
+## 任务清单（14 个）
 
 执行顺序遵循依赖：domain → infrastructure → application → api → 集成测试。每个任务都是一个完整的 TDD 循环（红→绿→commit）。
+
+---
+
+### Task 0: 项目骨架（目录 + `__init__.py`）
+
+**Files:**
+- Create: 7 个 `__init__.py`（见下表）
+- Create: `src/face_recognition/application/strategies/base.py`（工具函数）
+
+在写第一行领域代码之前，先把包目录结构搭好。Python 的 **src layout** 要求每个包目录下有一个 `__init__.py` 文件——即使内容为空，Python 才能把它识别为包（package）并允许 `from face_recognition.domain.entities import ...` 这样的 import。
+
+**为什么 `__init__.py` 可以是空的？** Python 3.3+ 引入了"隐式命名空间包"（PEP 420），技术上不需要 `__init__.py` 也能 import。但本项目显式保留空 `__init__.py`，原因：
+1. 明确标记"这是一个包目录"——阅读代码的人一眼能区分包目录和普通目录（如 `data/`、`scripts/`）
+2. `mypy` 和部分 IDE 仍以 `__init__.py` 的存在作为包识别依据
+3. 以后想加 `__all__` 控制导出或做延迟 import（`import` 放 `__init__.py` 里），文件已经在位
+
+- [ ] **Step 1: 创建目录和空的 `__init__.py`**
+
+```bash
+# 在项目根目录执行
+mkdir -p src/face_recognition/domain
+mkdir -p src/face_recognition/application/strategies
+mkdir -p src/face_recognition/infrastructure
+mkdir -p src/face_recognition/api/static
+mkdir -p src/face_recognition/evaluation
+mkdir -p tests/unit tests/integration
+
+# 每个包目录放一个空的 __init__.py
+touch src/face_recognition/__init__.py
+touch src/face_recognition/domain/__init__.py
+touch src/face_recognition/application/__init__.py
+touch src/face_recognition/application/strategies/__init__.py
+touch src/face_recognition/infrastructure/__init__.py
+touch src/face_recognition/api/__init__.py
+touch src/face_recognition/evaluation/__init__.py
+```
+
+- [ ] **Step 2: 创建 `base.py`（策略共享工具）**
+
+`base.py` 不定义策略 Protocol（那在 `domain/interfaces.py`），只放策略实现之间复用的纯函数。目前需要两个：L2 归一化和编码列表转矩阵。
+
+```python
+# src/face_recognition/application/strategies/base.py
+"""模板生成策略的共享工具函数。"""
+import numpy as np
+
+from face_recognition.domain.entities import FaceEncoding
+
+
+def l2_normalize(vector: np.ndarray) -> np.ndarray:
+    """L2 归一化：向量除以其范数，使结果在单位球面上（||v||=1）。
+    
+    Args:
+        vector: 任意形状的浮点向量，通常 (512,)。
+    Returns:
+        归一化后的向量，方向不变、长度为 1。
+    Raises:
+        ValueError: 向量范数接近零（如全零向量），归一化无意义。
+    """
+    norm = np.linalg.norm(vector)
+    if norm < 1e-10:
+        raise ValueError("向量范数接近零，无法归一化")
+    return vector / norm
+
+
+def encodings_to_matrix(encodings: list[FaceEncoding]) -> np.ndarray:
+    """将编码列表转为 (N, 512) 矩阵，方便批量计算。
+    
+    np.stack 沿新轴拼接：list[ndarray(512,)] → ndarray(N, 512)。
+    相比 np.array(list) 更明确意图。
+    """
+    return np.stack([e.vector for e in encodings])
+```
+
+- [ ] **Step 3: 跑测试确认骨架可用**
+
+```bash
+uv run python -c "from face_recognition.application.strategies.base import l2_normalize; print('OK')"
+```
+
+预期：`OK`（无 ImportError）
+
+- [ ] **Step 4: commit**
+
+```bash
+git add src/face_recognition/__init__.py \
+        src/face_recognition/domain/__init__.py \
+        src/face_recognition/application/__init__.py \
+        src/face_recognition/application/strategies/__init__.py \
+        src/face_recognition/infrastructure/__init__.py \
+        src/face_recognition/api/__init__.py \
+        src/face_recognition/evaluation/__init__.py \
+        src/face_recognition/application/strategies/base.py
+git commit -m "chore: 创建项目骨架（__init__.py + base.py 工具函数）"
+```
 
 ---
 
@@ -1595,19 +1690,45 @@ def test_mean_all_returns_one_normalized_centroid(encs: list[FaceEncoding]):
     assert _all_unit_norm(out)
 
 
-def test_manual_three_takes_first_three(encs: list[FaceEncoding]):
-    out = ManualThreeStrategy().build(encs)
+def test_manual_three_from_groups_returns_three_templates(make_encoding):
+    """三组各取均值——每组生成一个归一化模板。"""
+    groups = [
+        [make_encoding(0), make_encoding(1), make_encoding(2)],
+        [make_encoding(10), make_encoding(11)],
+        [make_encoding(20), make_encoding(21), make_encoding(22)],
+    ]
+    out = ManualThreeStrategy().build_from_groups(groups)
     assert len(out) == 3
     assert _all_unit_norm(out)
-    # 验证简化版"取前三"语义：第 i 个输出 = 输入第 i 个原向量
-    for i, tpl in enumerate(out):
-        assert np.allclose(tpl.encoding.vector, encs[i].vector)
+    # 验证 source 字段记录子文件夹来源
+    assert "subset_0" in out[0].source
+    assert "subset_1" in out[1].source
+    assert "subset_2" in out[2].source
 
 
-def test_manual_three_with_fewer_takes_all(make_encoding):
-    """不到 3 张时不要崩溃——尽量返回有多少给多少。"""
-    out = ManualThreeStrategy().build([make_encoding(0), make_encoding(1)])
+def test_manual_three_skips_empty_groups(make_encoding):
+    """某组无有效编码时跳过该组，不影响其它组。"""
+    groups = [
+        [make_encoding(0)],
+        [],  # 第二组为空——跳过
+        [make_encoding(20)],
+    ]
+    out = ManualThreeStrategy().build_from_groups(groups)
     assert len(out) == 2
+
+
+def test_manual_three_all_empty_groups_raises():
+    """所有组均为空时应抛异常，避免生成零模板的 Person。"""
+    with pytest.raises(ValueError):
+        ManualThreeStrategy().build_from_groups([[], [], []])
+
+
+def test_manual_three_build_fallback_to_mean(make_encoding):
+    """直接调用 build（非子文件夹模式）退化为 mean_all——兼容无子文件夹的数据集。"""
+    encs = [make_encoding(i) for i in range(10)]
+    out = ManualThreeStrategy().build(encs)
+    assert len(out) == 1
+    assert _all_unit_norm(out)
 
 
 def test_kmeans_k3_returns_three_normalized_centroids(encs):
@@ -1620,15 +1741,6 @@ def test_kmeans_k3_with_fewer_than_3_falls_back(make_encoding):
     """不到 3 张时降级，避免 sklearn 因 n_samples < n_clusters 报错。"""
     out = KMeansK3Strategy(seed=42).build([make_encoding(0), make_encoding(1)])
     assert len(out) == 2
-
-
-def test_manual_three_with_fewer_than_3_returns_what_it_has(make_encoding):
-    """manual_three 用 encodings[:3] 宽容切片——只有 2 张就返回 2 张，不报错。
-    这是评估流水线里"某人照片不够"的兜底：不让 5 策略对照实验里 manual_three 一家独崩。"""
-    out = ManualThreeStrategy().build([make_encoding(0), make_encoding(1)])
-    assert len(out) == 2
-    out_one = ManualThreeStrategy().build([make_encoding(0)])
-    assert len(out_one) == 1
 
 
 def test_all_vectors_returns_all_inputs(encs):
@@ -1767,33 +1879,82 @@ class MeanAllStrategy:
 
 ```python
 # src/face_recognition/application/strategies/manual_three.py
-from datetime import datetime, timezone
+"""
+策略 3：人工三分法（子文件夹分组取均值）。
 
+目录结构约定：每个人员的训练目录下建 3 个子文件夹——
+  <person_dir>/
+      subset_0/    ← 第一组（如正脸照）
+      subset_1/    ← 第二组（如侧脸照）
+      subset_2/    ← 第三组（如特殊表情/逆光）
+
+每组的全部编码取算术平均 → 各自生成 1 个模板（最多 3 个）。
+
+设计动机（WHY 子文件夹而非"取前三张"）：
+  真正的"人工挑 3 张"需要用户先给照片打标签（正光/侧光/逆光），然后
+  策略按标签分组。用子文件夹模拟这个流程：
+    1. 用户把照片拖进 subset_0/1/2 三个文件夹 = "打标签"
+    2. 策略读取每个文件夹、各自取均值 = "每种条件的代表向量"
+  这样既保留了"人工挑选"的语义，又不需要额外的标注文件格式。
+"""
+
+from datetime import UTC, datetime
+
+import numpy as np
+
+from face_recognition.application.strategies.base import l2_normalize
 from face_recognition.domain.entities import FaceEncoding, Template
 
 
 class ManualThreeStrategy:
-    """简化版：取前 3 张。生产中可换成根据照片标签（正光/侧光/逆光）挑选。
+    """策略 3：三个子文件夹各取平均，生成最多 3 个模板。
 
-    为什么本项目用"前 3 张"作为简化？真正的"人工挑 3 张"需要用户给每张照片打 tag
-    （正脸/侧脸/逆光），数据管道复杂。期末项目阶段不上这套——用列表前 3 张占位，
-    评估实验里如果它表现不如 KMeans，结论就是"自动聚类比朴素人工挑选好"。
+    属性 name 供 CLI 和依赖装配通过 TemplateStrategy Protocol 访问。
     """
 
     name = "manual_three"
 
+    def build_from_groups(
+        self, groups: list[list[FaceEncoding]]
+    ) -> list[Template]:
+        """从分组编码构建模板（主入口）。
+        
+        Args:
+            groups: 长度为 3 的列表，每元素是该分组下所有图片的编码。
+                    允许某组为空（如某人没有侧脸照），该组不生成模板。
+        Returns:
+            Template 列表（1~3 个）。每个 Template 的 source 记录来源分组。
+        Raises:
+            ValueError: 全部分组均为空，无法生成任何模板。
+        """
+        templates: list[Template] = []
+        for i, group_encodings in enumerate(groups):
+            if not group_encodings:
+                # 该分组无有效编码——跳过（如 subset_1 为空文件夹）
+                continue
+            # np.stack 把 list[ndarray] 拼成 (N, 512) 矩阵
+            vectors = np.stack([e.vector for e in group_encodings])
+            mean = np.mean(vectors, axis=0)        # 沿第 0 维（行）取平均 → (512,)
+            mean = l2_normalize(mean)              # 均值向量重新归一化到单位球面
+            templates.append(
+                Template(
+                    encoding=FaceEncoding(vector=mean.astype(np.float32)),
+                    source=f"subset_{i}_mean_n{len(group_encodings)}",
+                    created_at=datetime.now(UTC),
+                )
+            )
+        if not templates:
+            raise ValueError("所有分组均为空，无法生成模板")
+        return templates
+
     def build(self, encodings: list[FaceEncoding]) -> list[Template]:
-        if not encodings:
-            raise ValueError("ManualThreeStrategy 至少需要 1 个 encoding")
-        # encodings[:3] = Python 切片：取前 3 个元素。
-        #   - 不会越界：少于 3 个时返回所有，不抛错
-        #   - 这是 Python "宽容切片"的特性，与 list[index] 不同（后者越界会抛 IndexError）
-        chosen = encodings[:3]
-        # 列表推导式：把每个原始 encoding 包成 Template，记录 source="manual_0/1/2"
-        return [
-            Template(encoding=e, source=f"manual_{i}", created_at=datetime.now(timezone.utc).replace(tzinfo=None))
-            for i, e in enumerate(chosen)
-        ]
+        """兼容模式：没有子文件夹时退化为 mean_all。
+        
+        当数据集未按子文件夹组织时，本方法充当安全兜底——
+        把所有编码取平均生成 1 个模板，避免因策略选择而崩溃。
+        """
+        from face_recognition.application.strategies.mean_all import MeanAllStrategy
+        return MeanAllStrategy().build(encodings)
 ```
 
 - [ ] **Step 6: 实现 `kmeans_k3.py`**
@@ -2212,53 +2373,83 @@ class RegisterFace:
         self._strategy = strategy
         self._load_image = image_loader
 
+    # manual_three 策略的子文件夹名（与 prepare_lfw_dataset.py 脚本约定一致）
+    _MANUAL_SUBSETS = ("subset_0", "subset_1", "subset_2")
+
+    def _has_manual_subsets(self, person_dir: Path) -> bool:
+        """检查 person_dir 是否包含 manual_three 所需的子文件夹结构。"""
+        return (person_dir / "subset_0").is_dir()
+
+    def _encode_images(self, img_paths: list[Path]) -> tuple[list[FaceEncoding], int]:
+        """批量编码图片列表，返回 (成功编码列表, 跳过数量)。"""
+        encodings: list[FaceEncoding] = []
+        skipped = 0
+        for p in sorted(img_paths):
+            if p.suffix.lower() not in _IMG_EXTS:
+                continue
+            try:
+                img = self._load_image(p)
+                enc = self._pipeline.encode_single(img)
+                encodings.append(enc)
+            except FaceRecognitionError as e:
+                logger.warning("跳过 %s: %s", p, e)
+                skipped += 1
+        return encodings, skipped
+
     def execute_for_person(self, person_dir: Path) -> tuple[int, int]:
         """注册单个人。返回 (成功图片数, 跳过图片数)。失败抛 PersonHasNoTemplatesError。
+
+        对 manual_three 策略且目录含子文件夹时，走分组编码路径；
+        否则走扁平编码路径（遍历根目录所有图片）。
 
         跳过包含两类:扩展名不是图片(.txt/.DS_Store 等)、解码或检测失败(NoFaceError 等)。
         调用方拿到这俩数字往 RegisterSummary 里累加,用户在 CLI 末尾能看到准确统计。
         """
-        # 显式标注 list[FaceEncoding]——空 list 的元素类型 mypy 推不出，主动告知
-        encodings: list[FaceEncoding] = []
-        skipped = 0
-        # Path.iterdir() = 列出该目录下所有条目（不递归），返回 Path 生成器。
-        # sorted(...) 强制确定顺序——文件系统遍历顺序在不同平台不一致，
-        # 排序保证测试和实际运行结果可复现。
-        for img_path in sorted(person_dir.iterdir()):
-            # Path.suffix = 文件扩展名（含点）。.lower() 防大写 .JPG 漏过滤。
-            if img_path.suffix.lower() not in _IMG_EXTS:
-                continue  # 跳过非图片（如 .DS_Store、.txt 标注文件）—不计入 skipped,扩展名过滤是预筛
-            try:
-                img = self._load_image(img_path)
-                enc = self._pipeline.encode_single(img)
-                encodings.append(enc)
-            # except FaceRecognitionError 捕获我们自定义异常的**整个家族**
-            # （NoFaceError、MultipleFacesError 等都是它的子类，见 Task 2）。
-            # 不捕获 Exception——避免吞掉真正的程序 bug（KeyError 之类）。
-            except FaceRecognitionError as e:
-                # logging 的 % 占位符语法：logger.warning(fmt, *args)
-                # 优势 vs f-string：仅在 WARNING 级别真的输出时才做字符串拼接，
-                # 调用 .debug() 时如果当前级别是 INFO，省下拼接成本（虽然这里不重要）
-                logger.warning("跳过 %s: %s", img_path, e)
-                skipped += 1
+        total_encodings = 0
+        total_skipped = 0
 
-        # 全部失败 → 这个人彻底注册不上，向上抛
-        if not encodings:
+        if self._strategy.name == "manual_three" and self._has_manual_subsets(person_dir):
+            # ── manual_three 子文件夹路径 ──
+            # 对每个 subset_N 文件夹独立编码，分组传给 build_from_groups。
+            groups: list[list[FaceEncoding]] = []
+            for subset_name in self._MANUAL_SUBSETS:
+                subset_dir = person_dir / subset_name
+                if subset_dir.is_dir():
+                    img_paths = [
+                        p for p in subset_dir.iterdir()
+                        if p.suffix.lower() in _IMG_EXTS
+                    ]
+                    encs, sk = self._encode_images(img_paths)
+                    groups.append(encs)
+                    total_encodings += len(encs)
+                    total_skipped += sk
+                else:
+                    groups.append([])
+            # build_from_groups 处理各组取均值；空组自动跳过
+            templates = self._strategy.build_from_groups(groups)
+        else:
+            # ── 扁平路径（其它 4 种策略）──
+            img_paths = list(person_dir.iterdir())
+            encodings, total_skipped = self._encode_images(img_paths)
+            total_encodings = len(encodings)
+            if not encodings:
+                raise PersonHasNoTemplatesError(
+                    f"{person_dir.name}: 全部照片无法提取人脸"
+                )
+            templates = self._strategy.build(encodings)
+
+        if not templates:
             raise PersonHasNoTemplatesError(
-                f"{person_dir.name}: 全部照片无法提取人脸"
+                f"{person_dir.name}: 编码成功但未能生成任何模板"
             )
 
-        # 走到这里：至少有一张照片成功了。交给策略生成模板。
-        templates = self._strategy.build(encodings)
         person = Person(
-            # Path.name = 路径最后一段（不含父目录）。"data/alice/" → "alice"
             person_id=person_dir.name,
-            display_name=person_dir.name,  # 简化：用文件夹名做显示名
-            # tuple(list) 把 list 转 tuple，因为 Person.templates 字段类型是 tuple
+            display_name=person_dir.name,
             templates=tuple(templates),
         )
         self._repo.add(person)
-        return len(encodings), skipped
+        return total_encodings, total_skipped
 
     def execute(self, dataset_dir: Path) -> RegisterSummary:
         """批量注册整个数据集。"""
