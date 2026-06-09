@@ -2267,6 +2267,71 @@ git commit -m "feat(api): GET /api/persons/{id}/templates 查看模板"
 
 > 简化决策：spec 里说"1 capture 线程 + 1 recognition 线程"，本实现把它们合并为一个线程（capture.read → process_frame → encode_jpeg → put queue）。在 35 人小项目下足够，能避免线程间帧数据传递的额外队列。如果未来要解耦再拆。
 
+### §11.1 为什么摄像头画面和浏览器请求不能跑在同一条线上（从踩坑到修复）
+
+> 这一节记录了一个实际踩过的坑，以及最终修复方案。理解它不需要操作系统或计算机网络知识——只需要理解"阻塞"和"让路"的区别。
+> 期末答辩如果被问到 WebSocket 性能相关的问题，这一节的结论可以直接用。
+
+#### 踩坑过程
+
+**原始版本**：每一帧结尾有一行 `await asyncio.sleep(1 / fps)`（约 33ms）。这 33ms 里 asyncio 事件循环有空去处理浏览器请求（HTTP GET、WebSocket 关闭信号等）。
+
+```
+cam.read()阻塞 → 处理帧 → send → await sleep(33ms) → 事件循环处理请求 → 下一帧
+```
+
+**优化尝试**：为了提升帧率，先把 `sleep` 缩到 `sleep(0)`，然后直接删掉了——"摄像头本来就能跑 30fps，为什么还要手动等？"
+
+删掉之后，事件循环的"让路窗口"消失了：
+
+```
+cam.read()阻塞 → 处理帧 → send → cam.read()阻塞 → ...（无限循环，永不让路）
+```
+
+**症状**：刷新页面一直转圈、点停止摄像头绿灯不灭。浏览器发了请求，但 Python 唯一线程永远在 `cam.read()` 和其他处理之间忙碌，没有一刻空闲去**读操作系统网络缓冲区的请求**。
+
+**为什么不是"卡 33ms 就好了"**：每一帧 `cam.read()` 卡 33ms，然后 5ms 处理帧，然后立刻下一帧。这 5ms 窗口里事件循环也在忙（发 JPEG、发 JSON），恰好没空处理请求。请求在操作系统缓冲区排队，一等就是几十上百帧 = 几秒到十几秒。
+
+#### 修复：`asyncio.to_thread`
+
+把阻塞的 `cam.read()` 从主线程挪到子线程：
+
+```python
+# 修复前（主线程阻塞）
+frame = cam.read()
+
+# 修复后（子线程阻塞，主线程自由）
+frame = await asyncio.to_thread(cam.read)
+```
+
+**`await` 到底在做什么**：它不是"主线程被卡住等结果"。它是"我先去旁边排队，你们先走"。Python 把控制权还给事件循环，让它可以处理 HTTP 请求、WebSocket 关闭信号。子线程跑完了，callback 通知主线程："你的结果好了，回来继续干"。
+
+#### 三个线程的协作
+
+```
+子线程 1（asyncio.to_thread）：cam.read()  ← 等摄像头出帧（阻塞，33ms）
+子线程 2（detect_thread）：    detect_and_encode  ← 人脸检测（CPU 密集，200ms）
+
+主线程：处理浏览器请求 + 缩帧 + 画框 + JPEG 编码 + WebSocket 发送
+         ↑                                      ↑
+    子线程跑的时候，主线程不傻等                    这些轻量活主线程自己干
+    它去收 HTTP 请求、响应关闭信号
+```
+
+**检测结果怎么传给主线程**：两个线程通过共享变量 `last_tracks` 交换数据，用 `threading.Lock` 保护。主线程拿的时候有就新、没就旧——绝不等待。
+
+```python
+# 检测线程
+with lock:
+    last_tracks = 新结果
+
+# 主线程
+with lock:
+    current_tracks = last_tracks  # 直接拿，几微秒
+```
+
+**核心直觉**：async/await 不是多线程。它只有一条主线程。`await` 的意思是"我先去干别的，你好了叫我"，不是"开一条新线"。`asyncio.to_thread` 才是真正开临时线程——给那些不支持 async 的阻塞函数（如 OpenCV 的 `cam.read()`）一条出路。
+
 - [ ] **Step 1: 写测试**
 
 WebSocket 真实测试需要真摄像头，难自动化。这里写一个"路由能 accept 连接"的最小冒烟测试，真正端到端测试在 Task 13。
