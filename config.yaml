@@ -41,15 +41,15 @@ camera:
   # OpenCV VideoCapture 的设备索引。0 是默认摄像头，外接 USB 摄像头通常是 1。
   device_index: 0
 
-  # 采集分辨率。1280x720 在大多数笔记本摄像头上是质量与速度的平衡点。
-  resolution: [1280, 720]
+  # 采集分辨率。640x480 在 CPU 上可保证流畅帧率。
+  resolution: [640, 480]
 
   # 目标采集帧率。实际帧率由摄像头硬件决定，这里只是请求值。
   fps: 30
 
 realtime:
   # 检测频率：1 = 每帧都检测；2 = 隔帧检测（省算力但跟踪更易丢）。
-  detect_every_n_frames: 1
+  detect_every_n_frames: 2
 
   # 新跟踪框出现时是否立即跑识别。关闭可避免短暂晃过的人脸触发识别。
   recognize_on_new_track: true

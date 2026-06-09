@@ -21,12 +21,17 @@ router = APIRouter()
 
 @router.websocket("/ws/stream")
 async def websocket_stream(ws: WebSocket):
-    """实时推流：每帧发送 JPEG 二进制 + 识别结果 JSON。"""
+    """实时推流：每帧发送 JPEG 二进制 + 识别结果 JSON。
+
+    画面和识别解耦：
+    - 每帧都读摄像头 + 渲染 + 发 JPEG（保证画面流畅）
+    - 隔 N 帧才跑一次 detect_and_encode（节省算力）
+    - 中间帧复用上一次的 tracks 画框
+    """
     await ws.accept()
     logger.info("WebSocket 连接建立")
 
     cfg = get_config()
-    # 每个 WebSocket 连接独立 tracker（防止多客户端串号）
     use_case = build_recognize_frame_use_case()
 
     try:
@@ -39,6 +44,10 @@ async def websocket_stream(ws: WebSocket):
         await ws.close()
         return
 
+    detect_interval = cfg.realtime.detect_every_n_frames
+    last_tracks: list = []
+    frame_idx = 0
+
     try:
         while True:
             try:
@@ -47,11 +56,14 @@ async def websocket_stream(ws: WebSocket):
                 await ws.send_json({"error": "CAMERA_LOST"})
                 break
 
-            # 检测 + 跟踪 + 按需识别
-            tracks = use_case.process_frame(frame)
+            frame_idx += 1
 
-            # 画框 + 写名
-            rendered = render_tracks(frame, tracks)
+            # 隔帧检测：只在第 1 帧和每 N 帧跑检测+识别
+            if frame_idx == 1 or frame_idx % detect_interval == 0:
+                last_tracks = use_case.process_frame(frame)
+
+            # 始终用最新 tracks 画框（无论是否跑了检测）
+            rendered = render_tracks(frame, last_tracks)
 
             # 编码 JPEG
             jpeg_bytes = encode_jpeg(rendered, quality=cfg.realtime.jpeg_quality)
@@ -61,7 +73,7 @@ async def websocket_stream(ws: WebSocket):
 
             # 发送 JSON 元数据
             track_data = []
-            for t in tracks:
+            for t in last_tracks:
                 track_data.append({
                     "track_id": t.track_id,
                     "bbox": list(t.bbox),
@@ -70,7 +82,8 @@ async def websocket_stream(ws: WebSocket):
                 })
             await ws.send_json({"tracks": track_data, "threshold": use_case.threshold})
 
-            await asyncio.sleep(1.0 / cfg.camera.fps)
+            # 不 sleep：让摄像头按自己节奏出帧
+            await asyncio.sleep(0)
 
     except WebSocketDisconnect:
         logger.info("WebSocket 断开")

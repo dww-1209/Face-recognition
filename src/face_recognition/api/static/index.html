@@ -126,9 +126,17 @@ function switchTab(active) {
     pagePersons.hidden = true; pageStream.hidden = false;
     tabStream.classList.add("tab-active"); tabPersons.classList.remove("tab-active");
   }
+  location.hash = active;  // 写入 URL hash，刷新不丢状态
 }
 tabPersons.addEventListener("click", e => { e.preventDefault(); switchTab("persons"); });
 tabStream .addEventListener("click", e => { e.preventDefault(); switchTab("stream");  });
+
+// 首屏：根据 URL hash 决定默认 tab（刷新后回到之前的状态）
+if (location.hash === "#stream") switchTab("stream");
+window.addEventListener("hashchange", () => {
+  if (location.hash === "#stream") switchTab("stream");
+  else if (location.hash === "#persons") switchTab("persons");
+});
 
 // ===== 人员管理 =====
 const personsTbody = document.getElementById("persons-tbody");
