@@ -20,16 +20,9 @@ class CameraCapture:
         resolution: tuple[int, int],
         cap_factory: _CapFactory = cv2.VideoCapture,
     ) -> None:
-        # macOS 上摄像头释放后重开可能需要几秒——重试最多 5 次
-        import time
-
-        for attempt in range(5):
-            self._cap = cap_factory(device_index)
-            if self._cap.isOpened():
-                break
-            time.sleep(1.0)  # 等 1 秒再试
-        else:
-            raise CameraDisconnectedError(f"摄像头 {device_index} 无法打开（重试 5 次后）")
+        self._cap = cap_factory(device_index)
+        if not self._cap.isOpened():
+            raise CameraDisconnectedError(f"摄像头 {device_index} 无法打开")
         # cv2 的 set 设置不一定生效（取决于驱动），但常见 USB 摄像头都支持。
         # CAP_PROP_FRAME_WIDTH/HEIGHT 是常量整数（在 cv2 命名空间下），和 ffmpeg 的属性一一对应
         w, h = resolution
