@@ -139,22 +139,22 @@ data/lfw_subset/
 
 ```bash
 # 注册人员
-uv run python -m face_recognition.api.cli register \
+uv run face-recognition register \
     --dataset data/lfw_subset/train --strategy kmeans_k3
 
 # 单图识别
-uv run python -m face_recognition.api.cli recognize data/test/alice/001.jpg
+uv run face-recognition recognize data/test/alice/001.jpg
 
 # 列出 / 删除
-uv run python -m face_recognition.api.cli list
-uv run python -m face_recognition.api.cli remove alice
+uv run face-recognition list
+uv run face-recognition remove alice
 
 # 5 策略消融评估
-uv run python -m face_recognition.api.cli evaluate \
+uv run face-recognition evaluate \
     --dataset data/lfw_subset --n-lfw 50 --output reports
 
 # 启动 Web 服务
-uv run python -m face_recognition.api.cli serve
+uv run face-recognition serve
 ```
 
 ### 评估输出
