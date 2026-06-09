@@ -57,3 +57,16 @@ class RecognitionResult:
     similarity: float
     threshold: float
     matched_template_source: str | None = None  # 匹配到哪个模板
+
+
+@dataclass(frozen=True)
+class DetectedFace:
+    """一张人脸在某帧中的位置 + 编码。
+
+    实时场景使用：bbox 用于画框，encoding 用于查询模板矩阵。
+    M1 单图注册用 FaceEncoding 足够，不必关心 bbox。
+    """
+    # bbox 形式：(x1, y1, x2, y2) 整数像素坐标，左上 + 右下
+    # 用 tuple 而非 list：四个值一旦定下就不变，配合 frozen 保证不可变
+    bbox: tuple[int, int, int, int]
+    encoding: FaceEncoding

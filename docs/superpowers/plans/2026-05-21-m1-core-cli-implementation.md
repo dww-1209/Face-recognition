@@ -346,10 +346,12 @@ uv run pytest tests/unit/test_entities.py -v
 ```python
 # dataclasses 是 Python 3.7+ 标准库，让定义"只装数据的类"少写一堆样板代码
 # 没有它你要手写 def __init__(self, x, y): self.x = x; self.y = y; ... 一长串
-from dataclasses import dataclass
+# field 用于给字段加默认值工厂（default_factory），避免可变默认值被共享的坑
+from dataclasses import dataclass, field
 
 # datetime 类型用于 Template.created_at 字段
-from datetime import datetime, timezone
+# UTC 是 Python 3.11+ 的时区简写——等价于旧写法 datetime.timezone.utc
+from datetime import UTC, datetime
 
 import numpy as np
 
@@ -396,20 +398,25 @@ class FaceEncoding:
     # 用类型注解声明字段，dataclass 据此生成 __init__
     # np.ndarray 是 NumPy 数组类型；shape/dtype 在 __post_init__ 中校验
     vector: np.ndarray
-    model_version: str
+    # 给 model_version 设默认值 "buffalo_l"：绝大部分调用方不需要传这个参数，
+    # 只在"换了模型权重"这种罕见场景才需要显式覆盖
+    model_version: str = "buffalo_l"
 
     # __post_init__ 是 dataclass 提供的特殊方法：自动生成的 __init__ 跑完后会调用它
     # 用途：在构造结束后做字段校验。如果字段不合法，抛异常拦截构造
     # 这是"在系统边界做校验"的核心实践——非法实体根本无法存在
     def __post_init__(self) -> None:
-        # .shape 是 NumPy 数组的形状属性，返回元组
-        # 一维 512 长度向量的 shape 是 (512,)，注意逗号——Python 单元素元组写法
-        if self.vector.shape != (_EMBED_DIM,):
-            # f-string 是 Python 3.6+ 的字符串格式化语法
-            # f"...{expr}..." 中 {expr} 会被求值后插入字符串
+        # ndim 检查：防止传了 (1, 512) 或 (512, 1) 这种二维数组
+        if self.vector.ndim != 1 or self.vector.shape[0] != _EMBED_DIM:
             raise ValueError(
-                f"FaceEncoding 必须是 ({_EMBED_DIM},) 维，收到 {self.vector.shape}"
+                f"FaceEncoding 必须是 ({_EMBED_DIM},) 一维向量，收到 shape={self.vector.shape}"
             )
+        # dtype 宽容处理：如果不是 float32 就静默转换（而非抛异常），
+        # 因为 numpy 默认 float64，外部库可能随手传了 float64——让调用方省心
+        if self.vector.dtype != np.float32:
+            # frozen=True 下不能用 self.vector = ...，必须用 object.__setattr__
+            # 绕开 frozen 限制——这是 dataclass 约定俗成的后门
+            object.__setattr__(self, "vector", self.vector.astype(np.float32))
         # np.linalg.norm 默认计算 L2 范数（向量长度）
         # float(...) 把 NumPy 标量转 Python 原生 float
         #   - 避免后续 JSON 序列化、日志打印等场景遇到 numpy 类型的小麻烦
@@ -444,7 +451,12 @@ class Template:
 
     encoding: FaceEncoding
     source: str                 # 来源标识，如 "kmeans_centroid_0" / "raw_photo_3.jpg" / "mean"
-    created_at: datetime
+    # ── 给小白：为什么用 default_factory 而不是直接写 `= datetime.now(UTC)` ──
+    # 这是 Python 的经典坑：如果写 `created_at: datetime = datetime.now(UTC)`，
+    # 等号右边的表达式**在类定义时只执行一次**——所有 Template 实例会共享同一个时间戳！
+    # default_factory 接收一个无参函数，每次构造时调用，所以每一条 Template 拿到
+    # 各自独立的创建时间。这和 list/dict 默认参数不能用 [] 是同一个道理。
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 # ===== Person：领域聚合根 =====
@@ -463,6 +475,12 @@ class Person:
     #     tuple 是不可变容器，外层加内层都不可变，消除一类 bug
     templates: tuple[Template, ...]
 
+    # @property 把方法伪装成属性——调用方可以写 p.template_count 而不用 p.template_count()
+    # CLI `list` 命令和前端"人员列表"都要显示"每人几个模板"，所以这是一个常用只读属性
+    @property
+    def template_count(self) -> int:
+        return len(self.templates)
+
 
 # ===== RecognitionResult：识别用例的输出 =====
 @dataclass(frozen=True)
@@ -480,6 +498,9 @@ class RecognitionResult:
     person_id: str | None
     similarity: float           # 与最匹配模板的相似度，[-1, 1]
     threshold: float            # 当时使用的阈值
+    # 匹配到的模板来源（如 "kmeans_centroid_1"），用于前端展示"谁 + 哪张模板"匹配的
+    # None = 库里没人 / 分数不够阈值——没有"最匹配"这回事
+    matched_template_source: str | None = None
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -2314,27 +2335,18 @@ uv run pytest tests/unit/test_register_face.py -v
 ```python
 # Python 标准库的 logging。CLAUDE.md 第 2 节明确"用 basicConfig 即可，不上 loguru/structlog"。
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 
-from face_recognition.domain.entities import FaceEncoding, Person
-from face_recognition.domain.errors import (
-    FaceRecognitionError,
-    PersonHasNoTemplatesError,
-)
+from face_recognition.domain.entities import FaceEncoding, Person, Template
+from face_recognition.domain.errors import MultipleFacesError, NoFaceError
 from face_recognition.domain.interfaces import (
     FacePipeline,
     PersonRepository,
     TemplateStrategy,
 )
-
-# set 字面量：{".jpg", ".jpeg", ...}（注意大括号 + 元素，不是 dict）。
-# 用 set 而非 list：判断 `ext in _IMG_EXTS` 是 O(1) 哈希查找，list 是 O(n) 线性扫描。
-# 模块级私有常量，所有方法共享。
-_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # logging.getLogger(__name__) 标准用法：
 #   - __name__ = 当前模块的全限定名（如 "face_recognition.application.register_face"）
@@ -2342,21 +2354,22 @@ _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 #   - 这样不同模块的日志会带不同前缀，便于过滤和定位
 logger = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
-class RegisterSummary:
-    """注册批次结果统计。frozen=True 与 Task 1 的解释相同（不可变值对象）。"""
-    persons_succeeded: int
-    persons_failed: int
-    images_processed: int
-    images_skipped: int
+# manual_three 策略的子文件夹名（与 prepare_lfw_dataset.py 脚本约定一致）
+SUBSET_DIRS = ["subset_0", "subset_1", "subset_2"]
 
 
 class RegisterFace:
     """用例（use case）：表达一个完整的业务动作 = "注册一批人脸到库里"。
 
-    依赖通过构造函数注入（DI），不在内部 new。这就是为什么测试可以传 MagicMock：
+    依赖通过构造函数注入（DI），不在内部 new。这就是为什么测试可以传 FakePipeline：
     用例不知道 pipeline 是真模型还是假对象，只要符合 Protocol 即可。
+
+    和 plan 教学版的区别：
+    - 去掉了 `image_loader` 注入——生产代码直接用 cv2.imread，没必要把"读文件"
+      这种标准库操作也做成依赖。测试用真实 jpg 文件（tmp_path 写一张 112×112 黑图）
+      比 mock 一个 lambda 更直白、更贴近真实场景。
+    - `execute()` 返回 `dict` 而非 `RegisterSummary`——简单统计用 dict 够用，
+      加一个 frozen dataclass 只多一次拆包/属性访问的开销，不值。
     """
 
     def __init__(
@@ -2364,117 +2377,134 @@ class RegisterFace:
         pipeline: FacePipeline,
         repository: PersonRepository,
         strategy: TemplateStrategy,
-        # image_loader 是函数而非对象——把"读图"做成可注入的依赖，
-        # 测试时换成 lambda 返回假图，生产时传 cv2.imread 包装
-        image_loader: Callable[[Path], np.ndarray],
-    ) -> None:
-        self._pipeline = pipeline
-        self._repo = repository
-        self._strategy = strategy
-        self._load_image = image_loader
+    ):
+        self.pipeline = pipeline
+        self.repository = repository
+        self.strategy = strategy
 
-    # manual_three 策略的子文件夹名（与 prepare_lfw_dataset.py 脚本约定一致）
-    _MANUAL_SUBSETS = ("subset_0", "subset_1", "subset_2")
+    def execute(self, dataset_dir: str | Path) -> dict:
+        """
+        批量注册整个数据集。返回统计 dict 供 CLI 展示。
 
-    def _has_manual_subsets(self, person_dir: Path) -> bool:
+        Args:
+            dataset_dir: 数据集根目录，结构为 <dataset_dir>/<person_name>/*.jpg
+
+        Returns:
+            {"success": int, "skipped": int, "total_photos": int, "skipped_photos": int}
+            ── 为什么用 dict 而非 dataclass ──
+            注册统计只有 4 个 int 字段，不需要类型安全也不需要传递到多个地方。
+            CLI 拿到直接 f-string 拼输出，dict 够用。dataclass 是给"跨层传递的值对象"
+            （如 FaceEncoding、RecognitionResult）准备的，不是给"一次性统计"准备的。
+        """
+        dataset_dir = Path(dataset_dir)
+        if not dataset_dir.is_dir():
+            raise FileNotFoundError(f"数据集目录不存在: {dataset_dir}")
+
+        stats = {"success": 0, "skipped": 0, "total_photos": 0, "skipped_photos": 0}
+
+        for person_dir in sorted(dataset_dir.iterdir()):
+            if not person_dir.is_dir():
+                continue  # 跳过 README.md、.DS_Store 等非目录条目
+
+            person_id = person_dir.name
+            try:
+                person = self._register_person(person_dir, person_id)
+                self.repository.add(person)
+                stats["success"] += 1
+                logger.info(f"注册成功: {person_id} ({person.template_count} 个模板)")
+            except ValueError as e:
+                # 单人失败时**不向上传播**——只记 error 然后继续下一个人。
+                # 这是"批处理容错"的标准做法：1 个人挂了不连累整批。
+                stats["skipped"] += 1
+                logger.error(f"跳过 {person_id}: {e}")
+
+        logger.info(
+            f"注册完成: 成功 {stats['success']} 人, "
+            f"跳过 {stats['skipped']} 人, "
+            f"共 {stats['total_photos']} 张照片, "
+            f"跳过 {stats['skipped_photos']} 张"
+        )
+        return stats
+
+    def _register_person(self, person_dir: Path, person_id: str) -> Person:
+        """注册单个人：加载图片 → 编码 → 策略压缩 → 包装成 Person 返回。"""
+        # 检测是否为 manual_three 策略且存在子文件夹——是则走分组路径
+        if self.strategy.name == "manual_three" and self._has_subsets(person_dir):
+            templates = self._build_manual_templates(person_dir)
+        else:
+            # —— 扁平路径（其它 4 种策略）──
+            images = self._load_images(person_dir)
+            encodings = self._encode_images(images, person_dir)
+            if not encodings:
+                raise ValueError("全部照片无法识别人脸")
+            templates = self.strategy.build(encodings)
+
+        return Person(
+            person_id=person_id,
+            display_name=person_id,
+            templates=tuple(templates),
+        )
+
+    def _has_subsets(self, person_dir: Path) -> bool:
         """检查 person_dir 是否包含 manual_three 所需的子文件夹结构。"""
         return (person_dir / "subset_0").is_dir()
 
-    def _encode_images(self, img_paths: list[Path]) -> tuple[list[FaceEncoding], int]:
-        """批量编码图片列表，返回 (成功编码列表, 跳过数量)。"""
-        encodings: list[FaceEncoding] = []
-        skipped = 0
-        for p in sorted(img_paths):
-            if p.suffix.lower() not in _IMG_EXTS:
-                continue
-            try:
-                img = self._load_image(p)
-                enc = self._pipeline.encode_single(img)
-                encodings.append(enc)
-            except FaceRecognitionError as e:
-                logger.warning("跳过 %s: %s", p, e)
-                skipped += 1
-        return encodings, skipped
+    def _build_manual_templates(self, person_dir: Path) -> list[Template]:
+        """manual_three 专用：从子文件夹分组编码，调用 build_from_groups。"""
+        from face_recognition.application.strategies.manual_three import (
+            ManualThreeStrategy,
+        )
 
-    def execute_for_person(self, person_dir: Path) -> tuple[int, int]:
-        """注册单个人。返回 (成功图片数, 跳过图片数)。失败抛 PersonHasNoTemplatesError。
+        # 确保 strategy 是 ManualThreeStrategy 实例（防御性 cast）
+        strategy = self.strategy
+        if not isinstance(strategy, ManualThreeStrategy):
+            strategy = ManualThreeStrategy()
 
-        对 manual_three 策略且目录含子文件夹时，走分组编码路径；
-        否则走扁平编码路径（遍历根目录所有图片）。
+        groups: list[list[FaceEncoding]] = []
+        for subset_name in SUBSET_DIRS:
+            subset_dir = person_dir / subset_name
+            if subset_dir.is_dir():
+                images = self._load_images(subset_dir)
+                encodings = self._encode_images(images, subset_dir)
+                groups.append(encodings)
+            else:
+                groups.append([])  # 子文件夹不存在 → 空组，build_from_groups 内部跳过
 
-        跳过包含两类:扩展名不是图片(.txt/.DS_Store 等)、解码或检测失败(NoFaceError 等)。
-        调用方拿到这俩数字往 RegisterSummary 里累加,用户在 CLI 末尾能看到准确统计。
+        # build_from_groups：每组取均值 → 3 个模板；空组自动跳过
+        return strategy.build_from_groups(groups)
+
+    def _load_images(self, directory: Path) -> list[np.ndarray]:
+        """加载目录下所有图片（支持 jpg/png，跳过子文件夹）。
+
+        ── 给小白：为什么用 glob 而非 iterdir + set ──
+        glob 会自动按文件名字典序排序（sorted() 的效果），且一次调用只拿匹配后缀的文件。
+        用 iterdir 要手动过滤扩展名 + 手动排序，多写几行但无收益。glob 一行搞定。
         """
-        total_encodings = 0
-        total_skipped = 0
+        images = []
+        for ext in ("*.jpg", "*.jpeg", "*.png"):
+            for img_path in sorted(directory.glob(ext)):
+                img = cv2.imread(str(img_path))
+                if img is not None:  # imread 失败不抛异常，返回 None
+                    images.append(img)
+        return images
 
-        if self._strategy.name == "manual_three" and self._has_manual_subsets(person_dir):
-            # ── manual_three 子文件夹路径 ──
-            # 对每个 subset_N 文件夹独立编码，分组传给 build_from_groups。
-            groups: list[list[FaceEncoding]] = []
-            for subset_name in self._MANUAL_SUBSETS:
-                subset_dir = person_dir / subset_name
-                if subset_dir.is_dir():
-                    img_paths = [
-                        p for p in subset_dir.iterdir()
-                        if p.suffix.lower() in _IMG_EXTS
-                    ]
-                    encs, sk = self._encode_images(img_paths)
-                    groups.append(encs)
-                    total_encodings += len(encs)
-                    total_skipped += sk
-                else:
-                    groups.append([])
-            # build_from_groups 处理各组取均值；空组自动跳过
-            templates = self._strategy.build_from_groups(groups)
-        else:
-            # ── 扁平路径（其它 4 种策略）──
-            img_paths = list(person_dir.iterdir())
-            encodings, total_skipped = self._encode_images(img_paths)
-            total_encodings = len(encodings)
-            if not encodings:
-                raise PersonHasNoTemplatesError(
-                    f"{person_dir.name}: 全部照片无法提取人脸"
-                )
-            templates = self._strategy.build(encodings)
+    def _encode_images(
+        self, images: list[np.ndarray], source_dir: Path
+    ) -> list[FaceEncoding]:
+        """批量编码图片，单张失败记 warning 跳过（不中断整批）。
 
-        if not templates:
-            raise PersonHasNoTemplatesError(
-                f"{person_dir.name}: 编码成功但未能生成任何模板"
-            )
-
-        person = Person(
-            person_id=person_dir.name,
-            display_name=person_dir.name,
-            templates=tuple(templates),
-        )
-        self._repo.add(person)
-        return total_encodings, total_skipped
-
-    def execute(self, dataset_dir: Path) -> RegisterSummary:
-        """批量注册整个数据集。"""
-        # 一行多重赋值：a = b = c = 0 → 所有变量都指向同一个 0（int 是不可变所以没问题）
-        succeeded = failed = images_processed = images_skipped = 0
-        for person_dir in sorted(dataset_dir.iterdir()):
-            # Path.is_dir() = 是不是目录（不是文件、不是符号链接到不存在）
-            if not person_dir.is_dir():
-                continue
+        ── 给小白：为什么单张失败不抛异常 ──
+        私人数据集里常有合影、侧脸、戴口罩——SCRFD 检测不到脸是正常情况。
+        如果一张失败就整人注册失败，用户体验很糟。记 warning 跳过是对真实数据集的务实态度。
+        """
+        encodings = []
+        for i, img in enumerate(images):
             try:
-                n_ok, n_skip = self.execute_for_person(person_dir)
-                succeeded += 1
-                images_processed += n_ok
-                images_skipped += n_skip
-            # 单人失败时**不向上传播**——只记 error 然后继续下一个人。
-            # 这是"批处理容错"的标准做法：1 个人挂了不连累整批。
-            except PersonHasNoTemplatesError as e:
-                logger.error("跳过此人: %s", e)
-                failed += 1
-        return RegisterSummary(
-            persons_succeeded=succeeded,
-            persons_failed=failed,
-            images_processed=images_processed,
-            images_skipped=images_skipped,
-        )
+                enc = self.pipeline.encode_single(img)
+                encodings.append(enc)
+            except (NoFaceError, MultipleFacesError) as e:
+                logger.warning(f"{source_dir.name}/img_{i}: {e}, 跳过")
+        return encodings
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -2587,10 +2617,14 @@ uv run pytest tests/unit/test_recognize_face.py -v
 - [ ] **Step 3: 实现 `src/face_recognition/application/recognize_face.py`**
 
 ```python
+import logging
+
 import numpy as np
 
-from face_recognition.domain.entities import RecognitionResult
+from face_recognition.domain.entities import FaceEncoding, RecognitionResult
 from face_recognition.domain.interfaces import FacePipeline, PersonRepository
+
+logger = logging.getLogger(__name__)
 
 
 class RecognizeFace:
@@ -2598,51 +2632,123 @@ class RecognizeFace:
 
     核心算法：余弦相似度 = 单位向量点积。因为我们保证所有向量都 L2 归一化，
     所以"余弦相似度" ≡ "点积"。识别整库 = 一次矩阵乘法。
+
+    和 plan 教学版的区别（为何加了缓存层）：
+    - 教学版每次 `execute()` 都从 SQLite 重新加载全量模板矩阵。这在单次评估时
+      完全够用，但在 M4 WebSocket 实时流里——每秒 3~5 帧识别请求——每次 SQLite
+      往返 + BLOB 反序列化的开销不可接受（≈15ms/次 × 5fps = 75ms 纯 I/O）。
+    - 生产版加了 `_templates_matrix` 内存缓存，`refresh_cache()` 只在增删人员
+      后由调用方（dependencies 装配 / CLI 命令）显式触发。识别热路径只做矩阵乘法。
     """
 
     def __init__(
         self,
         pipeline: FacePipeline,
         repository: PersonRepository,
-        threshold: float,
-    ) -> None:
-        self._pipeline = pipeline
-        self._repo = repository
-        self._threshold = threshold
+        threshold: float = 0.45,
+    ):
+        self.pipeline = pipeline
+        self.repository = repository
+        self.threshold = threshold
+        # 缓存模板矩阵和 person_id 列表（注册后需刷新）
+        # None = 尚未加载，由 _ensure_cache() 延迟初始化
+        self._templates_matrix: np.ndarray | None = None
+        self._person_ids: list[str] | None = None
+
+    def refresh_cache(self) -> None:
+        """刷新模板矩阵缓存（增删人员后调用）。
+
+        ── 给小白：为什么叫 refresh_cache 而不是 load_cache ──
+        "refresh"暗示"已有数据被新数据替换"，比"load"更精确地表达了
+        缓存失效→重新加载的语义。这是行业惯例命名（`cache.refresh()`）。
+        """
+        self._templates_matrix, self._person_ids = (
+            self.repository.all_templates_matrix()
+        )
+
+    def _ensure_cache(self) -> None:
+        """延迟加载：首次识别时才从 SQLite 拉模板（而非构造时立刻拉）。
+
+        好处：如果构造了 RecognizeFace 但从未调用（如测试 setup），
+        不会触发不必要的 SQLite I/O。
+        """
+        if self._templates_matrix is None or self._person_ids is None:
+            self.refresh_cache()
 
     def execute(self, image: np.ndarray) -> RecognitionResult:
-        # 第 1 步：把图喂给 pipeline，提取 1 个 FaceEncoding（含 512 维向量）
-        enc = self._pipeline.encode_single(image)
-        # 第 2 步：从仓库一次性拿出所有模板矩阵。M = 总模板数。
-        matrix, person_ids = self._repo.all_templates_matrix()
-        # ndarray.shape[0] = 第 0 维大小，即"行数"=总模板数。
-        # 库为空时 (0, 512)，避免后面 argmax 在空数组上炸（会抛 ValueError）
-        if matrix.shape[0] == 0:
+        """
+        对单张图片执行识别（允许多脸——取第一张脸）。
+
+        Args:
+            image: BGR 格式图像（np.ndarray）
+
+        Returns:
+            RecognitionResult，person_id 为 None 表示库外陌生人
+        """
+        # 用 encode() 而非 encode_single()：允许图中多张脸，取第一张
+        # 这对实时摄像头场景很重要——画面边缘可能闯入第二张脸
+        encodings = self.pipeline.encode(image)
+        if not encodings:
             return RecognitionResult(
-                person_id=None, similarity=0.0, threshold=self._threshold
+                person_id=None,
+                similarity=0.0,
+                threshold=self.threshold,
             )
-        # 第 3 步：核心计算——一次矩阵乘法搞定所有相似度。
+
+        # 取第一张脸的编码
+        query = encodings[0]
+        return self._match(query)
+
+    def execute_single(self, image: np.ndarray) -> RecognitionResult:
+        """
+        要求图中恰好一张脸，否则抛异常（NoFaceError / MultipleFacesError）。
+
+        CLI `recognize` 命令用这个——单张照片识别，多脸就是异常。
+        """
+        query = self.pipeline.encode_single(image)
+        return self._match(query)
+
+    def _match(self, query: FaceEncoding) -> RecognitionResult:
+        """核心匹配逻辑：矩阵乘法一次拿到所有模板的相似度，取最大值判阈值。
+
+        提取为独立方法让 execute() 和 execute_single() 共用同一段匹配逻辑——
+        "从向量到结果"是纯计算，不关心向量来自单脸还是多脸的第一张。
+        """
+        self._ensure_cache()
+        assert self._templates_matrix is not None
+        assert self._person_ids is not None
+
+        # 库为空（未注册任何人）：(0, 512) 矩阵，argmax 会抛 ValueError
+        if self._templates_matrix.shape[0] == 0:
+            return RecognitionResult(
+                person_id=None,
+                similarity=0.0,
+                threshold=self.threshold,
+            )
+
+        # 核心计算——一次矩阵乘法搞定所有相似度。
         # `matrix @ enc.vector` 是 Python 3.5+ 的"矩阵乘法运算符"（@），
         # 等价于 np.matmul(matrix, enc.vector) 或 matrix.dot(enc.vector)。
         # 形状变化：(M, 512) @ (512,) = (M,)
-        # 每个元素 sims[i] = matrix[i] · enc.vector = 第 i 个模板与查询的余弦相似度
-        # （因为两者都已归一化，所以点积 = cos θ）。
-        sims = matrix @ enc.vector
-        # np.argmax(arr) = 返回最大值的索引（int 类型），等价于 arr.argmax()
-        # 显式 int(...) 转换：argmax 返回 numpy.int64，转回 Python int 让类型注解干净
-        best_idx = int(np.argmax(sims))
-        # numpy 标量转 Python float，理由同上
-        best_sim = float(sims[best_idx])
-        # 第 4 步：阈值判别——超过阈值才认领，否则返回未知（开放集核心特性）
-        if best_sim >= self._threshold:
+        # 每个元素 sims[i] = matrix[i] · query.vector = 第 i 个模板与查询的余弦相似度
+        # （因为两者都已 L2 归一化，所以点积 = cos θ）。
+        similarities = self._templates_matrix @ query.vector
+        # np.argmax(arr) = 返回最大值的索引（int 类型）
+        best_idx = int(np.argmax(similarities))
+        # numpy 标量转 Python float，让类型注解干净
+        best_sim = float(similarities[best_idx])
+
+        if best_sim >= self.threshold:
             return RecognitionResult(
-                person_id=person_ids[best_idx],
+                person_id=self._person_ids[best_idx],
                 similarity=best_sim,
-                threshold=self._threshold,
+                threshold=self.threshold,
             )
         # 仍然返回 best_sim（不是 0），方便上层日志展示"虽然没认出但最高也只有 0.42"
         return RecognitionResult(
-            person_id=None, similarity=best_sim, threshold=self._threshold
+            person_id=None,
+            similarity=best_sim,
+            threshold=self.threshold,
         )
 ```
 

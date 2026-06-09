@@ -1,92 +1,67 @@
-"""
-数据切分：读取已预分割的 LFW 数据集。
-
-数据集由 scripts/prepare_lfw_dataset.py 生成，已按 80/20 按人切分到 train/ test/。
-本模块提供加载接口，供 evaluation 和 register 复用。
-
-约定目录结构：
-  data/lfw_subset/
-  ├── train/<person_name>/*.jpg          # 80% 注册集
-  │             /subset_0/*.jpg          # → manual_three 子文件夹
-  │             /subset_1/*.jpg
-  │             /subset_2/*.jpg
-  └── test/<person_name>/*.jpg           # 20% 测试集（无子文件夹）
-"""
-
+import random
+from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
-import numpy as np
+# M1 Task 8 已经定义过的图片扩展名集合，复用同样口径
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def load_images(directory: Path) -> list[np.ndarray]:
-    """加载目录下所有图片（仅 jpg/png 文件，跳过子目录）。"""
-    images = []
-    for ext in ("*.jpg", "*.jpeg", "*.png"):
-        for img_path in sorted(directory.glob(ext)):
-            img = cv2.imread(str(img_path))
-            if img is not None:
-                images.append(img)
-    return images
+@dataclass(frozen=True)
+class PersonSplit:
+    """单个人的切分结果。"""
+    person_id: str
+    # tuple 而非 list：保持 frozen dataclass 的不可变语义一致性
+    train_paths: tuple[Path, ...]
+    test_paths: tuple[Path, ...]
 
 
-def load_train_set(root_dir: str | Path) -> dict[str, list[np.ndarray]]:
+def split_by_person(
+    dataset_root: Path,
+    train_ratio: float = 0.8,
+    seed: int = 42,
+    min_images: int = 5,
+) -> list[PersonSplit]:
+    """按人切分整个数据集。
+
+    参数：
+      dataset_root: 数据集根目录，子目录名 = person_id
+      train_ratio:  训练集比例（默认 80%）
+      seed:         随机种子（默认 42——和 spec/config.yaml 保持一致）
+      min_images:   每人最少需要的图片数；不足的人直接跳过
+
+    返回：
+      list[PersonSplit]，按 person_id 字典序排序——保证下游遍历顺序确定
     """
-    加载训练集所有人员图片。
+    # 用独立的 Random 实例，不污染全局 random.* 状态（M1 Task 7 random_one 同款理由）
+    rng = random.Random(seed)
+    splits: list[PersonSplit] = []
 
-    Returns:
-        {person_id: [images]} 字典
-    """
-    root = Path(root_dir) / "train"
-    if not root.is_dir():
-        raise FileNotFoundError(f"训练集目录不存在: {root}")
-
-    result = {}
-    for person_dir in sorted(root.iterdir()):
+    # sorted(...) 让人员遍历顺序在不同文件系统下都一致；
+    # 切分本身的随机性由 seed 控制，外层顺序也固定才能完全可复现
+    for person_dir in sorted(dataset_root.iterdir()):
         if not person_dir.is_dir():
+            continue  # 跳过 README.md、.DS_Store 之类
+        # 收集该人所有图片
+        images = sorted(
+            p for p in person_dir.iterdir()
+            if p.suffix.lower() in _IMG_EXTS
+        )
+        if len(images) < min_images:
             continue
-        images = load_images(person_dir)
-        if images:
-            result[person_dir.name] = images
-    return result
 
+        # rng.sample(seq, k) = 从 seq 里**无放回**抽 k 个，返回新列表（不改原 seq）。
+        # 等价于"洗牌后取前 k 个"，但比 shuffle + 切片更直白。
+        # 这里的妙处：seq 是排过序的，加上固定 seed → 抽样结果 100% 可复现。
+        n_train = int(len(images) * train_ratio)
+        train_set = rng.sample(images, n_train)
+        # 用 set 差集算"不在训练集里的图片"。set 运算 set(a) - set(b) = a 中减去 b 的元素
+        test_set = sorted(set(images) - set(train_set))
+        train_set_sorted = sorted(train_set)  # 给 train 也排序，便于断言
 
-def load_test_set(root_dir: str | Path) -> dict[str, list[np.ndarray]]:
-    """
-    加载测试集所有人员图片。
+        splits.append(PersonSplit(
+            person_id=person_dir.name,
+            train_paths=tuple(train_set_sorted),
+            test_paths=tuple(test_set),
+        ))
 
-    Returns:
-        {person_id: [images]} 字典
-    """
-    root = Path(root_dir) / "test"
-    if not root.is_dir():
-        raise FileNotFoundError(f"测试集目录不存在: {root}")
-
-    result = {}
-    for person_dir in sorted(root.iterdir()):
-        if not person_dir.is_dir():
-            continue
-        images = load_images(person_dir)
-        if images:
-            result[person_dir.name] = images
-    return result
-
-
-def load_train_subset_images(
-    root_dir: str | Path, person_id: str
-) -> list[list[np.ndarray]]:
-    """
-    加载某人的 manual_three 子文件夹图片（3 组）。
-
-    Returns:
-        [subset_0_images, subset_1_images, subset_2_images]
-    """
-    person_dir = Path(root_dir) / "train" / person_id
-    groups = []
-    for subset_name in ("subset_0", "subset_1", "subset_2"):
-        subset_dir = person_dir / subset_name
-        if subset_dir.is_dir():
-            groups.append(load_images(subset_dir))
-        else:
-            groups.append([])
-    return groups
+    return splits

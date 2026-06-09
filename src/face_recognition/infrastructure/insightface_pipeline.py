@@ -4,7 +4,7 @@ import logging
 
 import numpy as np
 
-from face_recognition.domain.entities import FaceEncoding
+from face_recognition.domain.entities import DetectedFace, FaceEncoding
 from face_recognition.domain.errors import MultipleFacesError, NoFaceError
 
 logger = logging.getLogger(__name__)
@@ -65,3 +65,16 @@ class InsightFacePipeline:
         if norm < 1e-10:
             raise ValueError("向量范数接近零")
         return vector / norm
+
+    def detect_and_encode(self, image: np.ndarray) -> list[DetectedFace]:
+        """同 encode，但保留 InsightFace 的 bbox（int4 像素坐标）。"""
+        faces = self.app.get(image)
+        out: list[DetectedFace] = []
+        for f in faces:
+            x1, y1, x2, y2 = f.bbox.astype(int).tolist()
+            enc = FaceEncoding(
+                vector=self._normalize(f.embedding.astype(np.float32)),
+                model_version=self.pack,
+            )
+            out.append(DetectedFace(bbox=(x1, y1, x2, y2), encoding=enc))
+        return out

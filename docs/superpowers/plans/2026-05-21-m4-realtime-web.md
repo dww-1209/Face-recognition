@@ -426,7 +426,7 @@ class IoUTracker:
         if track_id not in self._tracks:
             return  # track 已经被清理（罕见但要防）；安静忽略
         t = self._tracks[track_id]
-        t.identity = person_id
+        t.person_id = person_id
         t.similarity = similarity
         t.needs_recognition = False
         t.last_recognition_frame = frame_idx
@@ -808,7 +808,7 @@ def _blank_frame() -> np.ndarray:
 def test_render_tracks_draws_on_frame():
     """画框后帧不再全黑——至少画出来的位置有非零像素。"""
     frame = _blank_frame()
-    tracks = [Track(track_id=0, bbox=(100, 100, 300, 300), identity="alice", similarity=0.85)]
+    tracks = [Track(track_id=0, bbox=(100, 100, 300, 300), person_id="alice", similarity=0.85)]
     out = render_tracks(frame, tracks)
     # 矩形线条上应该有非零像素（OpenCV 默认线条颜色是绿色 (0, 255, 0)）
     # 我们检查框的左上角 1×1 区域 ——
@@ -817,10 +817,10 @@ def test_render_tracks_draws_on_frame():
     assert np.all(frame == 0)
 
 
-def test_render_tracks_handles_unknown_identity():
-    """identity=None（未识别）不报错，应该写"未知"或类似标签。"""
+def test_render_tracks_handles_unknown_person():
+    """person_id=None（未识别）不报错，应该写"未知"或类似标签。"""
     frame = _blank_frame()
-    tracks = [Track(track_id=0, bbox=(50, 50, 200, 200), identity=None)]
+    tracks = [Track(track_id=0, bbox=(50, 50, 200, 200), person_id=None)]
     out = render_tracks(frame, tracks)
     # 不崩溃就是过；具体文字内容不强求（避免 OpenCV 字体测试脆性）
     assert out.shape == frame.shape
@@ -860,11 +860,11 @@ def render_tracks(frame: np.ndarray, tracks: list[Track]) -> np.ndarray:
         # cv2.rectangle(img, pt1, pt2, color, thickness)
         # color 用 BGR 三元组：(0, 255, 0) = 纯绿
         # 已识别人员画绿色，未识别画红色——一眼区分
-        color = (0, 255, 0) if t.identity is not None else (0, 0, 255)
+        color = (0, 255, 0) if t.person_id is not None else (0, 0, 255)
         cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness=2)
 
-        # 标签文字：identity (similarity)，None 时写"未知"
-        label = f"{t.identity} ({t.similarity:.2f})" if t.identity else "未知"
+        # 标签文字：person_id (similarity)，None 时写"未知"
+        label = f"{t.person_id} ({t.similarity:.2f})" if t.person_id else "未知"
         # cv2.putText(img, text, org, fontFace, fontScale, color, thickness)
         # FONT_HERSHEY_SIMPLEX 是常见无衬线字体；fontScale=0.6 大致 14px 字号
         # 文字位置 (x1, y1 - 8)：框上方 8 像素留白，避免压框线
@@ -960,14 +960,14 @@ def test_first_frame_detects_and_recognizes():
     tracks = use_case.process_frame(frame)
 
     assert len(tracks) == 1
-    assert tracks[0].identity == "alice"
+    assert tracks[0].person_id == "alice"
     assert tracks[0].similarity == pytest.approx(0.85)
     assert tracks[0].needs_recognition is False  # 识别完成后置 False
     matrix.query.assert_called_once()
 
 
 def test_below_threshold_marks_unknown():
-    """相似度低于 threshold → identity 设为 None（未知人）。"""
+    """相似度低于 threshold → person_id 设为 None（未知人）。"""
     pipeline = MagicMock()
     pipeline.detect_and_encode.return_value = [
         _fake_face((10, 10, 50, 50)),
@@ -982,7 +982,7 @@ def test_below_threshold_marks_unknown():
 
     tracks = use_case.process_frame(np.zeros((480, 640, 3), dtype=np.uint8))
 
-    assert tracks[0].identity is None
+    assert tracks[0].person_id is None
     assert tracks[0].similarity == pytest.approx(0.30)
 
 
@@ -1026,7 +1026,7 @@ def test_track_re_recognizes_after_recheck_interval():
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     # 帧 0：识别 → unknown
     tracks = use_case.process_frame(frame)
-    assert tracks[0].identity is None
+    assert tracks[0].person_id is None
     # 帧 1, 2：在 recheck 窗口内，跳过
     use_case.process_frame(frame)
     use_case.process_frame(frame)
@@ -1034,7 +1034,7 @@ def test_track_re_recognizes_after_recheck_interval():
     # 帧 3：达到 recheck_interval=3，重新识别 → alice
     tracks = use_case.process_frame(frame)
     assert matrix.query.call_count == 2
-    assert tracks[0].identity == "alice"
+    assert tracks[0].person_id == "alice"
     assert tracks[0].similarity == pytest.approx(0.85)
 
 
@@ -1074,136 +1074,105 @@ uv run pytest tests/unit/application/test_recognize_frame.py -v
 - M1 的 RecognizeFace 用例（单张图）抛 NoFaceError 是合理的（用户明确给了一张照片，没脸是错误）
 - 这里语义不同，所以不复用，新建一个用例
 """
-from dataclasses import dataclass
 
 import numpy as np
 
+from face_recognition.application.template_matrix import TemplateMatrixService
+from face_recognition.domain.entities import DetectedFace
 from face_recognition.domain.interfaces import FacePipeline
 from face_recognition.infrastructure.iou_tracker import IoUTracker, Track
-from face_recognition.application.template_matrix import TemplateMatrixService
 
 
-@dataclass
 class RecognizeFrame:
-    """实时识别用例。
+    """实时帧识别用例：串起 pipeline / tracker / matrix，产出已识别的 tracks。
 
-    依赖通过 dataclass 字段注入（而非 __init__ 手写赋值）——
-    这是 Python 3.10+ 的常用模式，省掉重复模板代码。
+    和 M1 RecognizeFace 的区别：
+      - RecognizeFace：单张图 → 单个 RecognitionResult（CLI/评估用）
+      - RecognizeFrame：单帧 → 多 track 列表（实时摄像头用）
+        多了"跟踪 + 按需识别 + 重识别节流"逻辑
 
-    使用方式（在 api/server.py 的识别线程里）：
-        use_case = RecognizeFrame(pipeline=..., tracker=..., template_matrix=...,
-                                  threshold=0.45, recheck_interval=30)
-        while True:
-            frame = capture.read()
-            tracks = use_case.process_frame(frame)
-            # tracks 喂给 frame_renderer 画框 + 推到 WebSocket
+    依赖通过构造函数注入（非 dataclass——因为内部有可变状态 _frame_count，
+    用普通类比 dataclass 更直白）。
     """
-    pipeline: FacePipeline
-    tracker: IoUTracker
-    template_matrix: TemplateMatrixService
-    threshold: float
-    # 已识别 track 经过多少帧后强制重识别一次。
-    # 默认 30：30fps 摄像头下约 1 秒——首次入镜被判 unknown，1 秒后正脸再给一次机会。
-    # 设大数（如 10_000）= 实际禁用重识别，等同旧行为；设 1 = 每帧都识别（CPU 打满）。
-    recheck_interval: int = 30
-    # 内部帧计数器：每次 process_frame 调用一次就自增 1，从 0 开始数。
-    # ── 给新手解释三个细节 ──
-    #  (1) 为什么放在 dataclass 字段里而不是写一个全局变量 `frame_counter = 0`？
-    #      全局变量 = 整个 Python 进程共享一份。如果以后同时跑两路视频流（一路实时
-    #      摄像头 + 一路回放离线视频），它们会共用同一个计数器、互相干扰。
-    #      把它放进 dataclass 字段 = 每个 RecognizeFrame 实例各有一份，互不污染。
-    #      这是 OOP 里"封装状态"的小例子。
-    #  (2) 名字前面的下划线 `_` 是 Python 约定："这是内部状态，外部别碰"。
-    #      不是强制的（Python 没有 private），但读到 `_frame_counter` 的人就知道
-    #      "我不该在外部改它"。
-    #  (3) `: int = 0` 是类型注解 + 默认值。dataclass 会自动把它变成
-    #      __init__ 的参数，`RecognizeFrame(...)` 不传它时默认 0。
-    _frame_counter: int = 0
+
+    def __init__(
+        self,
+        pipeline: FacePipeline,
+        tracker: IoUTracker,
+        template_matrix: TemplateMatrixService,
+        threshold: float = 0.30,
+        recheck_interval: int = 30,
+    ):
+        self.pipeline = pipeline
+        self.tracker = tracker
+        self.matrix = template_matrix
+        self.threshold = threshold
+        # 已识别 track 经过多少帧后强制重识别一次。
+        # 默认 30：30fps 摄像头下约 1 秒——首次入镜被判 unknown，1 秒后正脸再给一次机会。
+        self.recheck_interval = recheck_interval
+        self._frame_count = 0
 
     def process_frame(self, frame: np.ndarray) -> list[Track]:
-        """处理一帧画面，返回更新后的所有 tracks。
+        """处理一帧：检测 → 跟踪 → 按需识别 → 返回 tracks。"""
+        self._frame_count += 1
 
-        流程：
-            1. pipeline 检测 + 编码（一站式）→ 拿到 list[DetectedFace]
-            2. 提取 bbox → 喂给 tracker.update → 拿到 tracks（含 needs_recognition 标记）
-            3. 对每个"需要识别"的 track（首次出现 OR 距上次识别超过 recheck_interval 帧），
-               找到对应 face、查 matrix、判阈值
-            4. tracker.set_identity 写回结果（同时记录当前帧号）
+        # 第 1 步：检测 + 编码（带 bbox）
+        faces: list[DetectedFace] = self.pipeline.detect_and_encode(frame)
+        boxes = [f.bbox for f in faces]
 
-        为什么"按需识别"而不是每帧都识别：
-            ResNet100 编码一次 ~10ms，如果每帧都识别每个脸，3 个脸的画面 30fps
-            就是 3×10×30=900ms/秒，CPU 直接打满。跟踪命中后跳过重复识别 = 省 90% 计算。
+        # 第 2 步：IoU 跟踪——把检测框匹配到已有 track
+        tracks = self.tracker.update(boxes)
 
-        为什么需要"N 帧后重识别"：
-            纯按 needs_recognition 标记会把 unknown 判定永久缓存——用户首次入镜恰逢
-            侧脸/逆光被打成 unknown，之后正脸面对摄像头也永远是 unknown 直到 track 消失。
-            每 N 帧（≈1 秒）强制再跑一次，给"翻盘"的机会。代价：每秒每张脸多一次推理，
-            可接受。
-        """
-        # 一站式调用 InsightFace：检测 + 5 关键点对齐 + 512 维向量编码
-        # detect_and_encode 是 M1 Task 0 加的方法，返回 list[DetectedFace]
-        # 每个 DetectedFace 有 .bbox（int4 元组）、.encoding（FaceEncoding，已 L2 归一化）
-        faces = self.pipeline.detect_and_encode(frame)
-
-        # 没人就早返回，避免后续无意义的循环
-        if not faces:
-            # 注意：还是要让 tracker 走一遍 update（喂空 list），
-            # 否则原先存在的 track 不会增加 missing_frames，永远不被清理
-            self._frame_counter += 1
-            return self.tracker.update([])
-
-        # 把 DetectedFace.bbox 拍扁成 tracker 要的 list[BBox]
-        # bbox 是 (x1, y1, x2, y2) int 元组，与 IoUTracker 的 BBox 类型一致
-        bboxes = [face.bbox for face in faces]
-
-        # tracker 一次性返回**当前帧**激活的 tracks（已过滤 missing > 0 的过期轨迹）
-        tracks = self.tracker.update(bboxes)
-
-        # 用 track.bbox 做主键匹配回 face：
-        # 注意不能用 dict(zip(bboxes, faces)) ——若两张脸 bbox 完全相同(极小概率)后者覆盖前者；
-        # 也不该读 tracker._tracks 私有属性。直接遍历 faces 找 bbox 相等的项最直白。
-        bbox_to_face = {tuple(face.bbox): face for face in faces}
-
-        for track in tracks:
-            # 触发识别的两种情况：
-            #   1) 首次出现的 track（needs_recognition=True，last_recognition_frame=-1）
-            #   2) 已识别但距上次识别已超过 recheck_interval 帧——给 unknown 翻盘机会
-            frames_since_last = self._frame_counter - track.last_recognition_frame
-            should_recognize = (
-                track.needs_recognition
-                or frames_since_last >= self.recheck_interval
-            )
-            if not should_recognize:
+        # 第 3 步：按需识别——只对新 track 跑矩阵查询
+        # ── 给小白：为什么不是每帧都识别 ──
+        # ResNet100 编码一次 ~10ms，3 张脸 × 30fps = 900ms/秒 全在编码。
+        # IoU 跟踪命中后跳过识别 = 省 90% CPU，画面依然流畅。
+        for t in tracks:
+            if not t.needs_recognition:
+                continue
+            df = self._find_face_for_track(t, faces)
+            if df is None:
                 continue
 
-            face = bbox_to_face.get(tuple(track.bbox))
-            if face is None:
-                continue  # 防御：理论上不会发生
-
-            # 查询模板矩阵：返回 (best_pid, max_similarity)
-            # face.encoding.vector 是已 L2 归一化的 (512,) float32
-            person_id, similarity = self.template_matrix.query(face.encoding.vector)
-
-            # 阈值判定：低于阈值 → 标为未知（identity=None）但仍记录 similarity 便于调试
-            # 注意：传入 self._frame_counter 让 tracker 记录"本次识别发生在哪一帧"，
-            # 下次进 process_frame 时根据这个值算 frames_since_last。
-            if similarity < self.threshold:
-                self.tracker.set_identity(
-                    track.track_id, None, similarity, self._frame_counter
-                )
+            pid, sim = self.matrix.query(df.encoding.vector)
+            if sim >= self.threshold:
+                t.person_id = pid
+                t.similarity = sim
             else:
-                self.tracker.set_identity(
-                    track.track_id, person_id, similarity, self._frame_counter
-                )
+                t.person_id = None
+                t.similarity = sim
+            t.needs_recognition = False
 
-        # 帧计数器自增——必须在所有 set_identity 调用后递增，
-        # 否则同一帧内被识别的 track，其 last_recognition_frame 会比"当前帧号"大 1，
-        # 下次 process_frame 时计算 frames_since_last 出错。
-        self._frame_counter += 1
+        # 第 4 步：定期重识别——给 unknown 翻盘机会
+        # ── 给小白：为什么需要重识别 ──
+        # 用户首次入镜恰逢侧脸/逆光被打成 unknown，纯按 needs_recognition 会永久缓存。
+        # 每隔 recheck_interval 帧强制重跑一次，给正脸"翻盘"机会。
+        if self._frame_count % self.recheck_interval == 0:
+            for t in tracks:
+                if t.missing_frames > 0:
+                    continue  # 丢失中的 track 不重识别
+                df = self._find_face_for_track(t, faces)
+                if df is None:
+                    continue
+                pid, sim = self.matrix.query(df.encoding.vector)
+                if sim >= self.threshold:
+                    t.person_id = pid
+                    t.similarity = sim
+                else:
+                    t.person_id = None
+                    t.similarity = sim
 
-        # set_identity 直接 mutate Track 对象 → tracks 列表里持有的就是同一批引用,
-        # 已包含最新 identity。直接返回,无需再访问 tracker 内部状态。
         return tracks
+
+    @staticmethod
+    def _find_face_for_track(
+        track: Track, faces: list[DetectedFace]
+    ) -> DetectedFace | None:
+        """通过 bbox 匹配找到 track 对应的 DetectedFace。"""
+        for f in faces:
+            if f.bbox == track.bbox:
+                return f
+        return None
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -1436,11 +1405,13 @@ def build_recognize_frame_use_case() -> RecognizeFrame:
 
 uvicorn 是 ASGI 服务器（异步版的 wsgi），FastAPI 必须用 ASGI 服务器（不能用 gunicorn 默认配置）。
 """
+
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from face_recognition.api.dependencies import (
@@ -1448,8 +1419,20 @@ from face_recognition.api.dependencies import (
     get_pipeline,
     get_template_matrix,
 )
+from face_recognition.api.routes_persons import router as persons_router
+from face_recognition.api.routes_stream import router as stream_router
+from face_recognition.domain.errors import FaceRecognitionError
 
 logger = logging.getLogger(__name__)
+
+# 错误码 → HTTP 状态码映射
+ERROR_TO_HTTP = {
+    "NO_FACE": 422,
+    "MULTIPLE_FACES": 422,
+    "PERSON_NOT_FOUND": 404,
+    "DUPLICATE_PERSON": 409,
+    "NO_TEMPLATES": 422,
+}
 
 
 @asynccontextmanager
@@ -1510,14 +1493,30 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ---- 全局异常处理 ----
+@app.exception_handler(FaceRecognitionError)
+async def domain_error_handler(request, exc: FaceRecognitionError):
+    status_code = ERROR_TO_HTTP.get(exc.code, 500)
+    return JSONResponse(
+        status_code=status_code,
+        content={"error_code": exc.code, "detail": str(exc)},
+    )
 
-# 挂载静态文件：把 src/face_recognition/api/static/ 挂到 /
-# html=True 让 / 自动返回 index.html（无需写 @app.get("/") 路由）
-# 注意 mount 必须在所有 @app.<method> 路由之后调用——否则会"吞掉"后注册的路由
-# 所以这一行放在文件最末（Task 7-11 加完路由后再 mount）。
-# 这里先写在最末作为占位：
+
+# ---- 注册路由 ----
+app.include_router(persons_router)
+app.include_router(stream_router)
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "pipeline_loaded": True}
+
+
+# ---- 静态文件（必须最后挂载，否则吞掉 API 路由） ----
 STATIC_DIR = Path(__file__).parent / "static"
-app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 ```
 
 > ⚠️ **重要顺序约束**：StaticFiles 的 `app.mount("/", ...)` 必须放在所有 `@app.get/post/...` 路由之后。后续 Task 7-12 会在 mount 之前插入路由。Task 6 暂时只挂 StaticFiles + lifespan，没有任何 API 路由。
@@ -2405,7 +2404,7 @@ def _recognition_loop(
             "tracks": [
                 {
                     "track_id": t.track_id,
-                    "identity": t.identity,
+                    "identity": t.person_id,
                     "similarity": round(t.similarity, 4),
                     "bbox": list(t.bbox),
                 }

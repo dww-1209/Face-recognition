@@ -34,6 +34,7 @@ class RealtimeConfig(BaseModel):
     iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     track_max_missing_frames: int = Field(default=15, ge=0)
     jpeg_quality: int = Field(default=85, ge=1, le=100)
+    recognition_recheck_interval: int = Field(default=30, ge=1, le=10_000)
 
 
 class ApiConfig(BaseModel):

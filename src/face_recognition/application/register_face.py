@@ -120,6 +120,40 @@ class RegisterFace:
                     images.append(img)
         return images
 
+    def register_from_frames(
+        self,
+        person_id: str,
+        display_name: str,
+        frames: list[np.ndarray],
+    ) -> Person:
+        """从内存帧列表注册（HTTP 上传场景）。
+
+        与 execute 的区别：
+          - 输入是已解码的 ndarray 列表（不是磁盘路径）
+          - 直接返回 Person 给上层做响应序列化
+        """
+        encodings: list[FaceEncoding] = []
+        for idx, frame in enumerate(frames):
+            try:
+                enc = self.pipeline.encode_single(frame)
+                encodings.append(enc)
+            except (NoFaceError, MultipleFacesError) as e:
+                logger.warning("跳过第 %d 张: %s", idx, e)
+
+        if not encodings:
+            raise ValueError(
+                f"{person_id}: 上传的 {len(frames)} 张全部无法提取人脸"
+            )
+
+        templates = self.strategy.build(encodings)
+        person = Person(
+            person_id=person_id,
+            display_name=display_name,
+            templates=tuple(templates),
+        )
+        self.repository.add(person)
+        return person
+
     def _encode_images(
         self, images: list[np.ndarray], source_dir: Path
     ) -> list[FaceEncoding]:

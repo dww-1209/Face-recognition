@@ -1,72 +1,66 @@
-"""
-LFW 库外陌生人加载器。
-
-用于生成 open impostor 配对：从 LFW 中取与库内人员不重叠的类别。
-"""
-
-import logging
+import random
+from dataclasses import dataclass
 
 import numpy as np
+# sklearn.datasets.fetch_lfw_people = 一行 LFW 下载器。
+#   - 第一次调用：从 vis-www.cs.umass.edu 下载 233MB tarball，解压到 ~/scikit_learn_data/lfw_home/
+#   - 之后调用：直接读缓存，几乎零成本
+#   - 选它而非"用户手动放图到 data/lfw_subset/"：可复现性更强（任何机器跑都拿到同一份）
+from sklearn.datasets import fetch_lfw_people
 
-logger = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class LfwImage:
+    """LFW 一张图。和 EvalEncoding 不同——LFW 阶段还没过 ArcFace，没有向量。"""
+    image: np.ndarray   # H × W × 3 uint8（注意 sklearn 默认是 RGB，cv2 是 BGR——下游做转换）
+    person_name: str    # LFW 里的姓名，作为伪 person_id 使用
 
 
-class LFWOpenSetLoader:
+def load_lfw_subset(n_persons: int = 50, seed: int = 42) -> list[LfwImage]:
+    """从 LFW 抽 n_persons 个不同的人，每人取 1 张图。
+
+    设计选择：
+      - **每人只抽 1 张**：评估只需要"不同陌生人"的多样性，同人多张反而引入相关性
+      - **从图库抽人而非按 LFW 的 official splits**：我们不做闭集分类，
+        不需要 sklearn 的 train/test 划分，自己抽样更直白
     """
-    从 LFW sklearn 数据集中加载库外陌生人。
+    # 三个关键参数（少一个都跑不通,已踩坑）：
+    # 1. color=True       拿 RGB 三通道（默认是灰度）。InsightFace 需要彩色。
+    # 2. resize=None      不缩放,保持 250×250。（默认 resize=0.5 → 125×125,小脸检测吃力）
+    # 3. slice_=None      ⚠️ 必须显式禁用默认的紧裁切。
+    #     fetch_lfw_people 默认 slice_=(slice(70,195), slice(78,172)) → 125×94,
+    #     脸几乎填满整图,SCRFD 检测器需要 padding 才能识别 → **100% 检测失败**。
+    #     设 slice_=None 拿原始 250×250,脸占大约一半,SCRFD 才有空间画 anchor。
+    # min_faces_per_person=1：默认是 50,会把 LFW 13000+ 人砍到 158 人。
+    #     我们只要"任意陌生人",门槛设到 1 拿全 5749 个人备选。
+    bunch = fetch_lfw_people(
+        color=True, resize=None, slice_=None, min_faces_per_person=1
+    )
 
-    注意：库内人员来自 prepare_lfw_dataset.py 选出的 ~30 类。
-    库外陌生人从 LFW 中取其他类别（与库内不重叠）。
-    """
+    # bunch.target 是 (N,) 的 person 索引数组，bunch.target_names 是名字列表
+    # numpy.unique(arr) = 返回去重后排序的数组——拿到所有不同的 person 索引
+    unique_persons = np.unique(bunch.target)
 
-    def __init__(self, min_faces: int = 10, random_seed: int = 42):
-        self.min_faces = min_faces
-        self.random_seed = random_seed
+    # 用独立 Random 实例做抽样
+    rng = random.Random(seed)
+    chosen_indices = rng.sample(list(unique_persons), n_persons)
 
-    def load_outsiders(
-        self, in_library_names: set[str], n_outsiders: int = 50
-    ) -> dict[str, list[np.ndarray]]:
-        """
-        从 LFW 中加载库外陌生人。
+    images: list[LfwImage] = []
+    for pid in chosen_indices:
+        # np.where(condition) 返回满足条件的下标元组。bunch.target == pid 是布尔数组，
+        # where 给出每个 True 的位置。[0] 取第 0 维（一维数组只有这维）
+        candidate_idx = np.where(bunch.target == pid)[0]
+        # 该人多张图里取第一张就行（评估侧不关心选哪张，只关心是陌生人）
+        first_idx = int(candidate_idx[0])
+        # ⚠️ **bunch.images 是 float32 范围 [0.0, 1.0]**,不是 [0, 255]。
+        # 这一点 sklearn 文档不显眼,源码 _lfw.py 里 `face /= 255.0` 才看得到——
+        # 直接 .astype(np.uint8) 会得到**全零数组**(所有像素 < 1.0 → 截断为 0),
+        # 下游 SCRFD 检测全军覆没。必须先 ×255 还原到 [0, 255] 再 cast。
+        # .clip(0, 255) 防止极端浮点抖动越界;.astype(uint8) 截断小数。
+        img_uint8 = (bunch.images[first_idx] * 255.0).clip(0, 255).astype(np.uint8)
+        images.append(LfwImage(
+            image=img_uint8,
+            person_name=str(bunch.target_names[pid]),
+        ))
 
-        Args:
-            in_library_names: 库内人员名集合，将与 LFW 类别取差集。
-            n_outsiders: 需要的库外人数。
-
-        Returns:
-            {person_name: [images]} — 每个库外人取 1 张图片。
-        """
-        from sklearn.datasets import fetch_lfw_people
-
-        # 下载完整的 LFW（不限类别数）
-        bunch = fetch_lfw_people(
-            min_faces_per_person=self.min_faces,
-            color=True,
-            resize=None,
-            slice_=None,
-            download_if_missing=True,
-        )
-
-        import random
-
-        rng = random.Random(self.random_seed)
-
-        outsiders = {}
-        for target_idx, name in enumerate(bunch.target_names):
-            if name in in_library_names:
-                continue
-
-            indices = np.where(bunch.target == target_idx)[0]
-            if len(indices) == 0:
-                continue
-
-            # 从该人的图片中随机选 1 张
-            chosen = rng.choice(indices)
-            img = (bunch.images[chosen] * 255).clip(0, 255).astype(np.uint8)
-            outsiders[name] = [img]
-
-            if len(outsiders) >= n_outsiders:
-                break
-
-        logger.info(f"加载 {len(outsiders)} 个库外陌生人")
-        return outsiders
+    return images

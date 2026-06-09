@@ -1,60 +1,55 @@
-"""OpenCV 摄像头采集封装。"""
-
-import logging
-import threading
+from collections.abc import Callable
 
 import cv2
 import numpy as np
 
 from face_recognition.domain.errors import CameraDisconnectedError
 
-logger = logging.getLogger(__name__)
+# Callable[[int], 任意]：M1 中已用过此类型注解
+# 这里 cap_factory 接收 device_index，返回一个有 isOpened/read/release 方法的对象（duck typing）
+# 默认指向 cv2.VideoCapture；测试时换成返回 MagicMock 的 lambda
+_CapFactory = Callable[[int], "cv2.VideoCapture"]
 
 
 class CameraCapture:
-    """后台线程持续采集摄像头帧，线程安全的最新帧读取。"""
+    """OpenCV VideoCapture 的薄封装，把 cv2 错误码翻译成领域异常。"""
 
-    def __init__(self, device_index: int = 0, resolution: tuple[int, int] = (1280, 720)):
-        self.device_index = device_index
-        self.resolution = resolution
-        self._cap: cv2.VideoCapture | None = None
-        self._frame: np.ndarray | None = None
-        self._lock = threading.Lock()
-        self._running = False
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        self._cap = cv2.VideoCapture(self.device_index)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+    def __init__(
+        self,
+        device_index: int,
+        resolution: tuple[int, int],
+        cap_factory: _CapFactory = cv2.VideoCapture,
+    ) -> None:
+        # 懒得把 cv2.VideoCapture 写死——cap_factory 让测试可以注入 mock
+        self._cap = cap_factory(device_index)
         if not self._cap.isOpened():
-            raise CameraDisconnectedError(f"无法打开摄像头 {self.device_index}")
-        self._running = True
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self._thread.start()
-        logger.info(f"摄像头启动: {self.resolution}")
-
-    def _capture_loop(self) -> None:
-        while self._running and self._cap is not None:
-            ret, frame = self._cap.read()
-            if not ret:
-                logger.error("摄像头读取失败")
-                self._running = False
-                break
-            with self._lock:
-                self._frame = frame
+            raise CameraDisconnectedError(f"摄像头 {device_index} 无法打开")
+        # cv2 的 set 设置不一定生效（取决于驱动），但常见 USB 摄像头都支持。
+        # CAP_PROP_FRAME_WIDTH/HEIGHT 是常量整数（在 cv2 命名空间下），和 ffmpeg 的属性一一对应
+        w, h = resolution
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
 
     def read(self) -> np.ndarray:
-        """获取最新帧（非阻塞）。"""
-        with self._lock:
-            if self._frame is None:
-                raise CameraDisconnectedError("尚无帧可用")
-            return self._frame.copy()
+        """读取一帧。失败抛 CameraDisconnectedError。"""
+        # cv2 的 read 返回 (ret: bool, frame: np.ndarray | None)。
+        # 失败原因可能是摄像头被拔、被其他程序占用、驱动崩溃。
+        ret, frame = self._cap.read()
+        if not ret or frame is None:
+            raise CameraDisconnectedError("摄像头读取失败")
+        # ── 给小白：frame 的颜色顺序是 BGR，不是 RGB（OpenCV 最大的坑） ──
+        # cv2.VideoCapture.read() / cv2.imread() 返回的 ndarray 形状 (H, W, 3) uint8，
+        # 但**通道顺序是 BGR**（蓝-绿-红），不是新手熟悉的 RGB。这是 OpenCV 1999 年
+        # 那版作者遗留的历史习惯，沿用至今。
+        # 后果：
+        #   - 直接喂 InsightFace `app.get(frame)` ✓ 没事——InsightFace 接 BGR
+        #   - 直接喂 cv2.imencode(".jpg", frame) ✓ 没事——cv2 全家都是 BGR
+        #   - 直接喂 PIL.Image.fromarray(frame) ✗ 颜色会反（人脸变蓝紫色）
+        #   - 直接喂 matplotlib.imshow(frame) ✗ 同上
+        # 想给非 OpenCV 工具看，要先转：`cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)`。
+        # 本项目链路全在 OpenCV/InsightFace 内部转，**不需要**手动 cvtColor。
+        return frame
 
-    def stop(self) -> None:
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=2.0)
-        if self._cap:
-            self._cap.release()
-        logger.info("摄像头已释放")
+    def release(self) -> None:
+        """释放摄像头资源。FastAPI 关闭时调用。"""
+        self._cap.release()

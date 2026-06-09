@@ -1617,11 +1617,22 @@ def test_encode_lfw_images_uses_person_name_as_id():
 
 
 def test_encode_lfw_images_skips_no_face():
-    """无脸 LFW 图（罕见但要防御）：抛 NoFaceError 时跳过。"""
+    """无脸 LFW 图（罕见但要防御）：抛 NoFaceError 时跳过。
+
+    注意：encode_lfw_images 有 10% 跳过率守卫——如果超过 10% 的图编码失败会抛
+    RuntimeError（防止系统性 bug 静默污染评估指标）。所以测试里造 10 张图、只有
+    1 张失败（10% 刚好未超阈值），验证单张失败被安静跳过。
+    """
     pipeline = MagicMock()
-    pipeline.encode_single.side_effect = NoFaceError("无脸")
-    lfw_imgs = [LfwImage(image=np.zeros((250, 250, 3), dtype=np.uint8), person_name="Ghost")]
-    assert encode_lfw_images(pipeline, lfw_imgs) == []
+    ok = FaceEncoding(vector=_unit_vec(0), model_version="buffalo_l")
+    # 10 张图：第一张抛异常，后 9 张正常 → 跳过率 10% ≤ 阈值 10%
+    pipeline.encode_single.side_effect = [NoFaceError("无脸")] + [ok] * 9
+    lfw_imgs = [
+        LfwImage(image=np.zeros((250, 250, 3), dtype=np.uint8), person_name=f"P{i}")
+        for i in range(10)
+    ]
+    result = encode_lfw_images(pipeline, lfw_imgs)
+    assert len(result) == 9  # 1 张被跳过
 ```
 
 - [ ] **Step 2: 跑测试确认失败**

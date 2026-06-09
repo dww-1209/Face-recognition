@@ -1,377 +1,195 @@
-"""
-5 策略消融实验主入口。
-
-流程：
-  1. 加载预分割的 train/test 数据
-  2. 编码所有图片（一次编码，5 策略复用）
-  3. 对每个策略：
-     a. 构建模板库
-     b. 生成 Genuine / 库内 Impostor / 库外 Impostor 分数
-     c. 计算 EER / TAR@FAR / ROC
-  4. 输出 CSV + ROC 图 + Markdown 报告
-"""
-
-import csv
 import logging
-import time
 from pathlib import Path
 
 import numpy as np
 
+# 5 个策略来自 M1 application 层，**各自一个子模块**——M1 没写
+# `application/strategies/__init__.py` 的 re-export，所以这里必须按子模块路径分别 import。
+# 如果以后想批量 import，可在 M1 里给 strategies/__init__.py 加 `from .random_one import ...`
 from face_recognition.application.strategies.all_vectors import AllVectorsStrategy
 from face_recognition.application.strategies.kmeans_k3 import KMeansK3Strategy
 from face_recognition.application.strategies.manual_three import ManualThreeStrategy
 from face_recognition.application.strategies.mean_all import MeanAllStrategy
 from face_recognition.application.strategies.random_one import RandomOneStrategy
-from face_recognition.domain.entities import FaceEncoding, Template
-from face_recognition.domain.interfaces import TemplateStrategy
-from face_recognition.evaluation.data_split import (
-    load_test_set,
-    load_train_set,
-    load_train_subset_images,
-)
-from face_recognition.evaluation.lfw_loader import LFWOpenSetLoader
+from face_recognition.domain.entities import FaceEncoding
+from face_recognition.domain.interfaces import FacePipeline, TemplateStrategy
+from face_recognition.evaluation import lfw_loader, reports
+from face_recognition.evaluation.data_split import PersonSplit, split_by_person
+from face_recognition.evaluation.embedder import encode_image_paths, encode_lfw_images
 from face_recognition.evaluation.metrics import (
     compute_eer,
-    compute_roc_curve,
+    compute_roc,
     compute_tar_at_far,
+    compute_top1_accuracy,
+    compute_top1_with_threshold,
 )
-from face_recognition.infrastructure.insightface_pipeline import InsightFacePipeline
+from face_recognition.evaluation.pair_generator import (
+    generate_genuine_pairs,
+    generate_open_impostor_pairs,
+)
+from face_recognition.evaluation.types import EvalEncoding, PairResult, StrategyMetrics
 
 logger = logging.getLogger(__name__)
 
-# 所有策略的工厂
-STRATEGIES: dict[str, TemplateStrategy] = {
-    "random_one": RandomOneStrategy(seed=42),
-    "mean_all": MeanAllStrategy(),
-    "manual_three": ManualThreeStrategy(),
-    "kmeans_k3": KMeansK3Strategy(seed=42),
-    "all_vectors": AllVectorsStrategy(),
-}
+
+# 5 个策略以"名字 → 实例"映射列出，方便循环消融。
+# RandomOneStrategy / KMeansK3Strategy 构造时要传 seed（M1 dependencies.build_strategy 同款做法）；
+# 其余三个无参。
+def _all_strategies(seed: int) -> dict[str, TemplateStrategy]:
+    return {
+        "random_one": RandomOneStrategy(seed=seed),
+        "mean_all": MeanAllStrategy(),
+        "manual_three": ManualThreeStrategy(),
+        "kmeans_k3": KMeansK3Strategy(seed=seed),
+        "all_vectors": AllVectorsStrategy(),
+    }
+
+
+def _build_templates_per_person(
+    person_id: str,
+    train_encodings: list[EvalEncoding],
+    strategy: TemplateStrategy,
+    pipeline: FacePipeline,
+) -> list[EvalEncoding]:
+    """跑一个策略,把训练集映射成该人的"模板向量集"(可以是 1~N 个)。
+
+    策略可能返回 1 个(mean_all/random_one)或多个(kmeans_k3=3、all_vectors=N)Template。
+    **评估口径**:保留多模板,scoring 时对每个 query 取 max_t cos(query, t) 作为该人得分。
+    这与生产识别(M1 RecognizeFace 的多模板矩阵 max-by-template)逻辑完全一致,
+    避免了"评估时强行平均→kmeans_k3 退化为 mean_all"的失真。
+
+    Edge case: 训练集为空 → 返回 []，调用方应跳过该人，不能让 0 模板的人混进 impostor 配对
+    （否则 cos(any_query, ∅) 在矩阵实现里是 -inf 还是 0 都是 bug——不如压根不存在）。
+
+    Edge case: 训练集 < 策略要求数（如 kmeans_k3 但只有 2 张照片）→ M1 的策略实现里
+    已有降级路径（kmeans_k3 把 < k 时直接返回所有原始 encoding；
+    manual_three 若无子文件夹则退化为 mean_all），所以本函数不再二次校验，
+    相信 strategy.build 的契约：
+        len(strategy.build(encs)) <= max(len(encs), strategy.max_templates)
+    """
+    if not train_encodings:
+        # 训练集为空：上游 split 阶段保证不会发生（按人 80/20 切，每人至少 1 张训练图），
+        # 但留这层防御是因为 LFW 库外集合可能因 encode 失败被压到 0
+        logger.warning("person_id=%s 训练集为空，跳过该人模板构建", person_id)
+        return []
+
+    # M1 定义的策略接口签名(domain/interfaces.py):
+    #   def build(self, encodings: list[FaceEncoding]) -> list[Template]
+    # FaceEncoding 需要 model_version,从 pipeline 读取(不再硬编码 "buffalo_l")。
+    fe_list = [
+        FaceEncoding(vector=e.vector, model_version=pipeline.model_version)
+        for e in train_encodings
+    ]
+    templates = strategy.build(fe_list)
+    if not templates:
+        # 策略主动返回 0 模板：当前 5 个策略都不会发生，但接口允许；防御一下
+        logger.warning(
+            "person_id=%s 策略 %s 返回 0 模板，跳过", person_id, strategy.__class__.__name__
+        )
+        return []
+
+    # 把每个 Template 包成 EvalEncoding 返回(共享同一 person_id);
+    # image_path 用第一张图占位,仅作 debug 回溯。
+    return [
+        EvalEncoding(
+            vector=t.encoding.vector.astype(np.float32),
+            person_id=person_id,
+            image_path=train_encodings[0].image_path,
+        )
+        for t in templates
+    ]
 
 
 def run_ablation(
-    dataset_dir: str = "data/lfw_subset",
-    n_outsiders: int = 20,
-    far_targets: list[float] | None = None,
-    output_dir: str = "reports",
-) -> dict:
-    """
-    运行 5 策略消融实验。
+    dataset_root: Path,
+    output_dir: Path,
+    pipeline: FacePipeline,
+    n_lfw: int = 50,
+    seed: int = 42,
+    target_far: float = 1e-3,
+) -> list[StrategyMetrics]:
+    """跑完整 5 策略消融实验，所有产物写入 output_dir。
 
-    Args:
-        dataset_dir: 预分割数据集根目录（含 train/ test/）
-        n_outsiders: 库外陌生人数
-        far_targets: 目标 FAR 列表
-        output_dir: 报告输出目录
+    返回 list[StrategyMetrics] 给调用方（CLI 命令、Notebook、测试）做断言或追加分析。
     """
-    if far_targets is None:
-        far_targets = [0.001, 0.01, 0.1]
-
-    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("===== Step 1: 加载数据 =====")
-    train_set = load_train_set(dataset_dir)
-    test_set = load_test_set(dataset_dir)
-    logger.info(f"训练集: {len(train_set)} 人, 测试集: {len(test_set)} 人")
+    logger.info("[1/5] 切分数据集 (seed=%d)…", seed)
+    splits: list[PersonSplit] = split_by_person(dataset_root, seed=seed)
+    logger.info("  得到 %d 人", len(splits))
 
-    # 加载库外陌生人
-    in_library = set(train_set.keys())
-    open_loader = LFWOpenSetLoader(min_faces=10)
-    open_set = open_loader.load_outsiders(in_library, n_outsiders=n_outsiders)
-
-    logger.info("===== Step 2: 加载 InsightFace 模型 =====")
-    pipeline = InsightFacePipeline()
-
-    logger.info("===== Step 3: 编码所有图片 =====")
-    # 编码训练集（含 manual_three 子文件夹）
-    train_encodings: dict[str, list[FaceEncoding]] = {}
-    train_manual_groups: dict[str, list[list[FaceEncoding]]] = {}
-
-    for person_id, images in sorted(train_set.items()):
-        encs = []
-        for img in images:
-            try:
-                encs.append(pipeline.encode_single(img))
-            except Exception as e:
-                logger.warning(f"train/{person_id}: {e}")
-        train_encodings[person_id] = encs
-
-        # manual_three 子文件夹编码
-        groups = load_train_subset_images(dataset_dir, person_id)
-        manual_groups = []
-        for group_images in groups:
-            group_encs = []
-            for img in group_images:
-                try:
-                    group_encs.append(pipeline.encode_single(img))
-                except Exception as e:
-                    logger.warning(f"train/{person_id}/subset: {e}")
-            manual_groups.append(group_encs)
-        train_manual_groups[person_id] = manual_groups
-
-    # 编码测试集
-    test_encodings: dict[str, list[FaceEncoding]] = {}
-    for person_id, images in sorted(test_set.items()):
-        encs = []
-        for img in images:
-            try:
-                encs.append(pipeline.encode_single(img))
-            except Exception as e:
-                logger.warning(f"test/{person_id}: {e}")
-        test_encodings[person_id] = encs
-
-    # 编码库外集
-    open_encodings: dict[str, list[FaceEncoding]] = {}
-    for person_id, images in sorted(open_set.items()):
-        encs = []
-        for img in images:
-            try:
-                encs.append(pipeline.encode_single(img))
-            except Exception as e:
-                logger.warning(f"open/{person_id}: {e}")
-        open_encodings[person_id] = encs
-
-    logger.info("===== Step 4: 5 策略消融 =====")
-    results = {}
-    all_roc_data = {}
-
-    for strategy_name, strategy in STRATEGIES.items():
-        logger.info(f"--- 策略: {strategy_name} ---")
-        t0 = time.time()
-
-        # 4a. 构建模板库
-        templates_db = _build_templates_db(
-            strategy_name, strategy, train_encodings, train_manual_groups, dataset_dir
+    logger.info("[2/5] 编码训练集 + 测试集…")
+    # 提前把每个人的 train/test 图片都编码好——5 策略复用相同的向量集，避免重复推理
+    train_encodings_per_person: dict[str, list[EvalEncoding]] = {}
+    test_encodings: list[EvalEncoding] = []
+    for sp in splits:
+        train_encodings_per_person[sp.person_id] = encode_image_paths(
+            pipeline, list(sp.train_paths), sp.person_id
+        )
+        test_encodings.extend(
+            encode_image_paths(pipeline, list(sp.test_paths), sp.person_id)
         )
 
-        # 4b. 生成三组分数
-        genuine_scores, closed_scores, open_scores = _compute_scores(
-            templates_db, test_encodings, open_encodings
-        )
-        impostor_scores = np.concatenate([closed_scores, open_scores])
+    logger.info("[3/5] 加载 LFW 库外陌生人 (n=%d)…", n_lfw)
+    lfw_imgs = lfw_loader.load_lfw_subset(n_persons=n_lfw, seed=seed)
+    lfw_encodings = encode_lfw_images(pipeline, lfw_imgs)
 
-        # 4c. 计算指标
-        eer, eer_threshold = compute_eer(genuine_scores, impostor_scores)
-        far_curve, tar_curve, roc_thresholds = compute_roc_curve(
-            genuine_scores, impostor_scores
-        )
+    logger.info("[4/5] 跑 5 策略并计算指标…")
+    all_metrics: list[StrategyMetrics] = []
+    # 在每策略循环里我们要把 pairs 也存下来给直方图用
+    pairs_per_strategy: dict[str, list[PairResult]] = {}
 
-        tar_at_far_values = {}
-        for target_far in far_targets:
-            tar_at_far_values[f"TAR@FAR={target_far}"] = compute_tar_at_far(
-                genuine_scores, impostor_scores, target_far
-            )
+    for name, strategy in _all_strategies(seed).items():
+        logger.info("  策略：%s", name)
+        # 4.1 用策略把每个人 train_set 压成模板向量集(可能 1~N 个);
+        # 评估全程保留多模板,scoring 用 max-similarity(见 generate_*_pairs)。
+        templates: dict[str, list[EvalEncoding]] = {}
+        for pid, encs in train_encodings_per_person.items():
+            tpls = _build_templates_per_person(pid, encs, strategy, pipeline)
+            if tpls:
+                templates[pid] = tpls
 
-        elapsed = time.time() - t0
+        # 4.2 造配对：Genuine + 库外 Impostor（spec 已决定省去库内 Impostor）
+        genuine = generate_genuine_pairs(test_encodings, templates)
+        open_imp = generate_open_impostor_pairs(lfw_encodings, templates)
+        all_pairs = genuine + open_imp
+        pairs_per_strategy[name] = all_pairs
 
-        result = {
-            "strategy": strategy_name,
-            "n_templates": sum(len(v) for v in templates_db.values()),
-            "EER": eer,
-            "EER_threshold": eer_threshold,
-            "n_genuine": len(genuine_scores),
-            "n_impostor": len(impostor_scores),
-            "time_sec": elapsed,
-            **tar_at_far_values,
-        }
-        results[strategy_name] = result
-        all_roc_data[strategy_name] = (far_curve, tar_curve, roc_thresholds)
+        # 4.3 计算指标
+        eer, eer_thresh = compute_eer(all_pairs)
+        tar = compute_tar_at_far(all_pairs, target_far=target_far)
+        top1 = compute_top1_accuracy(test_encodings, templates)
+        # 带阈值版本用本策略自己的 EER 阈值,衡量"端到端可用性"——见 metrics.py 注释
+        top1_thr = compute_top1_with_threshold(test_encodings, templates, threshold=eer_thresh)
+        fpr, tpr, _ = compute_roc(all_pairs)
 
-        logger.info(
-            f"  EER={eer:.4f} @ thresh={eer_threshold:.4f}, "
-            f"TAR@FAR=1e-3={tar_at_far_values.get('TAR@FAR=0.001', 0):.4f}, "
-            f"耗时={elapsed:.1f}s"
-        )
+        all_metrics.append(StrategyMetrics(
+            strategy_name=name,
+            eer=eer,
+            eer_threshold=eer_thresh,
+            tar_at_far_1e3=tar,
+            top1_accuracy=top1,
+            top1_with_threshold=top1_thr,
+            roc_fpr=fpr,
+            roc_tpr=tpr,
+            n_genuine=len(genuine),
+            n_impostor=len(open_imp),
+        ))
 
-    # Step 5: 输出
-    _save_csv(results, output_dir / "ablation_results.csv")
-    _save_roc_plot(all_roc_data, output_dir / "roc_curves.png")
-    _save_report(results, output_dir / "summary.md")
-
-    logger.info(f"===== 完成！报告保存在 {output_dir}/ =====")
-    return results
-
-
-def _build_templates_db(
-    strategy_name: str,
-    strategy: TemplateStrategy,
-    train_encodings: dict[str, list[FaceEncoding]],
-    train_manual_groups: dict[str, list[list[FaceEncoding]]],
-    dataset_dir: str,
-) -> dict[str, list[Template]]:
-    """为每个库内人员构建模板。"""
-    db: dict[str, list[Template]] = {}
-
-    for person_id, encodings in sorted(train_encodings.items()):
-        if strategy_name == "manual_three":
-            groups = train_manual_groups.get(person_id, [])
-            try:
-                templates = strategy.build_from_groups(groups)  # type: ignore[attr-defined]
-            except ValueError:
-                # 子文件夹为空，退化为 mean_all
-                if encodings:
-                    templates = MeanAllStrategy().build(encodings)
-                else:
-                    templates = []
-        else:
-            if encodings:
-                templates = strategy.build(encodings)
-            else:
-                templates = []
-
-        if templates:
-            db[person_id] = templates
-
-    return db
-
-
-def _compute_scores(
-    templates_db: dict[str, list[Template]],
-    test_encodings: dict[str, list[FaceEncoding]],
-    open_encodings: dict[str, list[FaceEncoding]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    计算三组相似度分数（逐对比较，不复用 max）。
-
-    每张 test 图与模板库所有模板做矩阵乘法一次拿到全部分数，
-    然后按 person_id 是否匹配分到 genuine / impostor 桶中。
-
-    Returns:
-        (genuine_scores, closed_impostor_scores, open_impostor_scores)
-    """
-    # 构建模板矩阵和 person_id 列表
-    all_templates = []
-    tpl_person_ids = []
-    for pid, tpls in sorted(templates_db.items()):
-        for tpl in tpls:
-            all_templates.append(tpl.encoding.vector)
-            tpl_person_ids.append(pid)
-    if not all_templates:
-        empty = np.array([], dtype=np.float64)
-        return empty, empty, empty
-    tpl_matrix = np.stack(all_templates)  # (M, 512)
-    tpl_pids = np.array(tpl_person_ids)
-
-    # 一次性编码所有 test 向量
-    test_pids = []
-    test_vecs = []
-    for pid, encs in sorted(test_encodings.items()):
-        for enc in encs:
-            test_pids.append(pid)
-            test_vecs.append(enc.vector)
-    test_matrix = np.stack(test_vecs) if test_vecs else np.empty((0, 512))
-
-    # (N_test, M_tpl) 相似度矩阵
-    if test_matrix.shape[0] > 0:
-        sims = test_matrix @ tpl_matrix.T  # (N_test, M)
-    else:
-        sims = np.empty((0, 0))
-
-    # Genuine: query_pid == tpl_pid
-    genuine_scores = []
-    closed_scores = []
-    for i, q_pid in enumerate(test_pids):
-        for j, t_pid in enumerate(tpl_pids):
-            if q_pid == t_pid:
-                genuine_scores.append(sims[i, j])
-            else:
-                closed_scores.append(sims[i, j])
-
-    # 库外 Impostor: 对 open_encodings 每张图单独矩阵乘法
-    open_scores = []
-    for pid, encs in open_encodings.items():
-        for enc in encs:
-            open_sims = tpl_matrix @ enc.vector  # (M,)
-            open_scores.extend(open_sims.tolist())
-
-    return (
-        np.array(genuine_scores, dtype=np.float64),
-        np.array(closed_scores, dtype=np.float64),
-        np.array(open_scores, dtype=np.float64),
+    logger.info("[5/5] 写报告到 %s …", output_dir)
+    reports.write_csv(all_metrics, output_dir / "summary.csv")
+    reports.plot_roc_curves(all_metrics, output_dir / "roc_curves.png")
+    hist_images: dict[str, str] = {}
+    for name, pairs in pairs_per_strategy.items():
+        rel = f"hist_{name}.png"
+        reports.plot_score_histogram(pairs, name, output_dir / rel)
+        hist_images[name] = rel
+    reports.write_markdown(
+        all_metrics,
+        output_dir / "summary.md",
+        roc_image="roc_curves.png",
+        hist_images=hist_images,
     )
 
-
-def _save_csv(results: dict, path: Path) -> None:
-    if not results:
-        return
-    fieldnames = list(next(iter(results.values())).keys())
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in results.values():
-            writer.writerow(r)
-    logger.info(f"CSV 已保存: {path}")
-
-
-def _save_roc_plot(all_roc_data: dict, path: Path) -> None:
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        logger.warning("matplotlib 不可用，跳过 ROC 图生成")
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
-
-    for (name, (far, tar, _)), color in zip(all_roc_data.items(), colors):
-        ax.plot(far, tar, label=name, color=color, linewidth=1.5)
-
-    ax.plot([0, 1], [0, 1], "k--", alpha=0.3, label="random")
-    ax.set_xscale("log")
-    ax.set_xlabel("FAR (False Accept Rate)")
-    ax.set_ylabel("TAR (True Accept Rate)")
-    ax.set_title("5-Strategy Ablation: ROC Curves")
-    ax.legend(loc="lower right")
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(1e-4, 1.0)
-    ax.set_ylim(0.0, 1.05)
-
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    logger.info(f"ROC 图已保存: {path}")
-
-
-def _save_report(results: dict, path: Path) -> None:
-    lines = [
-        "# 5 策略消融实验报告",
-        "",
-        "## 实验设置",
-        "- 数据集：LFW（~30 类，每类 ≥50 张）",
-        "- 数据切分：80% 注册 / 20% 测试（按人切分，seed=42）",
-        "- 评估三元组：Genuine / 库内 Impostor / 库外 Impostor",
-        "",
-        "## 结果汇总",
-        "",
-        "| 策略 | 模板数 | EER | TAR@FAR=1e-3 | TAR@FAR=0.01 |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-
-    for r in results.values():
-        lines.append(
-            f"| {r['strategy']} | {r['n_templates']} | "
-            f"{r['EER']:.4f} | {r.get('TAR@FAR=0.001', 0):.4f} | "
-            f"{r.get('TAR@FAR=0.01', 0):.4f} |"
-        )
-
-    lines += [
-        "",
-        "## 策略推荐",
-        "",
-        "综合准确率、检索效率、自动化程度，推荐使用 **kmeans_k3** 作为部署策略。",
-        "",
-        f"推荐阈值（EER 工作点）：**{results.get('kmeans_k3', {}).get('EER_threshold', 0.45):.4f}**",
-    ]
-
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    logger.info(f"报告已保存: {path}")
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    run_ablation()
+    logger.info("完成。最优策略（按 EER）：%s", min(all_metrics, key=lambda m: m.eer).strategy_name)
+    return all_metrics

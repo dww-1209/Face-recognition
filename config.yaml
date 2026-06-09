@@ -65,6 +65,10 @@ realtime:
   # 85 是肉眼接近无损的临界值；640×480 帧约 30~60KB，30fps 下带宽 ~10Mbps，本机回环无压力。
   jpeg_quality: 85
 
+  # 已识别 track 经过多少帧后强制重识别一次（给 unknown 翻盘机会）。
+  # 30fps 下 30 帧 ≈ 1 秒。
+  recognition_recheck_interval: 30
+
 api:
   host: "0.0.0.0"
   port: 8000

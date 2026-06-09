@@ -145,27 +145,31 @@ def evaluate(
         "data/lfw_subset",
         "--dataset",
         "-d",
-        help="预分割数据集根目录（含 train/ test/）",
+        help="数据集根目录（按人分文件夹，由 data_split 按人 80/20 切分）",
     ),
-    outsiders: int = typer.Option(20, "--outsiders", "-n", help="库外陌生人数"),
     output: str = typer.Option("reports", "--output", "-o", help="报告输出目录"),
+    n_lfw: int = typer.Option(50, "--n-lfw", "-n", help="LFW 库外陌生人数"),
 ) -> None:
     """运行 5 策略消融实验。输出 ROC 曲线、EER、TAR@FAR 到 reports/。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
-    results = run_ablation(
-        dataset_dir=dataset,
-        n_outsiders=outsiders,
-        output_dir=output,
+    config = load_config()
+    pipeline = build_pipeline(config)
+    all_metrics = run_ablation(
+        dataset_root=Path(dataset),
+        output_dir=Path(output),
+        pipeline=pipeline,
+        n_lfw=n_lfw,
+        seed=config.evaluation.random_seed,
     )
     typer.echo("\n===== 5 策略消融结果 =====")
-    for name, r in results.items():
+    for m in all_metrics:
         typer.echo(
-            f"{name:15s}  EER={r['EER']:.4f}  "
-            f"TAR@FAR=1e-3={r.get('TAR@FAR=0.001', 0):.4f}  "
-            f"({r['n_templates']} templates, {r['time_sec']:.1f}s)"
+            f"{m.strategy_name:15s}  EER={m.eer:.4f}  "
+            f"TAR@FAR=1e-3={m.tar_at_far_1e3:.4f}  "
+            f"({m.n_genuine} Gen / {m.n_impostor} Imp)"
         )
 
 

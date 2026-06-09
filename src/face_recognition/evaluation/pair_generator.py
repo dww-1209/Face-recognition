@@ -1,80 +1,90 @@
-"""
-评估配对生成器：生成 Genuine / 库内 Impostor / 库外 Impostor 三组配对。
-
-配对不存储图片，只记录 (query_person_id, template_person_id, image_index)，
-由下游负责加载和编码。
-"""
-
-
+# Genuine / 库内 Impostor / 库外 Impostor 三种配对的生成器。
+# 共同模式：双重循环 + 算余弦 + 包成 PairResult。
 import numpy as np
 
-
-def _pair_count(test_sets: dict[str, list]) -> dict[str, int]:
-    """统计每个测试人员有多少张照片。"""
-    return {pid: len(imgs) for pid, imgs in test_sets.items()}
+from face_recognition.evaluation.types import EvalEncoding, PairResult
 
 
-def gen_genuine_pairs(
-    train_set: dict[str, list[np.ndarray]],
-    test_set: dict[str, list[np.ndarray]],
-) -> list[tuple[str, str, int]]:
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    """两个**已 L2 归一化**的向量的余弦相似度 = 点积。
+    M1 已经多次出现，这里只一行：np.dot(a, b) 标量返回。
     """
-    生成 Genuine 配对：同一人的测试照 vs 自己的模板。
+    # float() 把 np.float32 转成 Python float，避免下游 dataclass 字段类型不一致
+    return float(np.dot(a, b))
 
-    Returns:
-        [(query_person_id, template_person_id, image_index), ...]
-        其中 query_person_id == template_person_id
+
+def _max_cosine(query: np.ndarray, templates: list[EvalEncoding]) -> float:
+    """对一组同人模板取最高相似度——评估口径与生产 RecognizeFace 一致。
+
+    多模板策略(kmeans_k3 / all_vectors)的本意是"覆盖同一人的不同视角/光照",
+    检索时只要 query 和**任何一个**模板足够近就视为命中,所以应该 max 而非 mean。
     """
-    pairs = []
-    for person_id, images in sorted(test_set.items()):
-        if person_id not in train_set:
+    return max(_cosine(query, t.vector) for t in templates)
+
+
+def generate_genuine_pairs(
+    queries: list[EvalEncoding],
+    templates: dict[str, list[EvalEncoding]],
+) -> list[PairResult]:
+    """同人配对:每个 query 对自己 person_id 的模板组取 max 相似度。
+
+    queries: 测试集(每张测试图一个 EvalEncoding)
+    templates: 每人 1~N 个模板向量(取决于策略),scoring 时取 max。
+    """
+    pairs: list[PairResult] = []
+    for q in queries:
+        # dict.get 在 key 不存在时返回 None,不抛 KeyError——
+        # 允许"测试集出现库里没有的人",体现开放集场景的健壮性
+        tpls = templates.get(q.person_id)
+        if not tpls:
             continue
-        for i in range(len(images)):
-            pairs.append((person_id, person_id, i))
+        pairs.append(PairResult(
+            score=_max_cosine(q.vector, tpls),
+            is_genuine=True,
+            query_person=q.person_id,
+            template_person=q.person_id,
+        ))
     return pairs
 
 
-def gen_closed_impostor_pairs(
-    train_set: dict[str, list[np.ndarray]],
-    test_set: dict[str, list[np.ndarray]],
-) -> list[tuple[str, str, int]]:
+def generate_closed_impostor_pairs(
+    queries: list[EvalEncoding],
+    templates: dict[str, list[EvalEncoding]],
+) -> list[PairResult]:
+    """库内异人配对:query 对**其他人**的模板组取 max 相似度。
+
+    spec 已决定省去库内 Impostor,函数留着以备切回。
     """
-    生成库内 Impostor 配对：张三的测试照 vs 李四的模板。
-
-    每张测试照只与第一个不同人的模板配对（避免组合爆炸）。
-    """
-    train_pids = sorted(train_set.keys())
-    pairs = []
-
-    for query_pid, images in sorted(test_set.items()):
-        if query_pid not in train_set:
-            continue
-        # 取第一个与 query 不同的注册人作为 impostor
-        for tpl_pid in train_pids:
-            if tpl_pid != query_pid:
-                for i in range(len(images)):
-                    pairs.append((query_pid, tpl_pid, i))
-                break  # 每张测试照只配一个 impostor
-
+    pairs: list[PairResult] = []
+    for q in queries:
+        for tpl_pid, tpls in templates.items():
+            if tpl_pid == q.person_id:
+                continue  # 跳过同人,那是 genuine 的活
+            pairs.append(PairResult(
+                score=_max_cosine(q.vector, tpls),
+                is_genuine=False,
+                query_person=q.person_id,
+                template_person=tpl_pid,
+            ))
     return pairs
 
 
-def gen_open_impostor_pairs(
-    open_set: dict[str, list[np.ndarray]],
-    train_set: dict[str, list[np.ndarray]],
-) -> list[tuple[str, str, int]]:
-    """
-    生成库外 Impostor 配对：库外陌生人的照片 vs 库内所有模板。
+def generate_open_impostor_pairs(
+    lfw_queries: list[EvalEncoding],
+    templates: dict[str, list[EvalEncoding]],
+) -> list[PairResult]:
+    """库外陌生人配对:LFW 人作为 query,对每个库内人的模板组取 max 相似度。
 
-    Returns:
-        [(outsider_person_id, template_person_id, image_index), ...]
+    所有产出 is_genuine=False(陌生人不可能"是"库里的任何人)。
+    数量级:50 个 LFW × 35 个库内 → 1750 对。
     """
-    train_pids = sorted(train_set.keys())
-    pairs = []
-
-    for outsider_pid, images in sorted(open_set.items()):
-        # 只取第一个库内人员的模板（所有库内模板都会比较，但配对只记录一组）
-        if train_pids:
-            for i in range(len(images)):
-                pairs.append((outsider_pid, train_pids[0], i))
+    pairs: list[PairResult] = []
+    for q in lfw_queries:
+        for tpl_pid, tpls in templates.items():
+            pairs.append(PairResult(
+                score=_max_cosine(q.vector, tpls),
+                is_genuine=False,
+                query_person=q.person_id,   # "LFW_xxx" 风格的伪 ID
+                template_person=tpl_pid,
+            ))
     return pairs

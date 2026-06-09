@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from face_recognition.domain.entities import (
+    DetectedFace,
     FaceEncoding,
     Person,
     RecognitionResult,
@@ -58,3 +59,10 @@ def test_recognition_result_unknown_has_none_person_id():
     r = RecognitionResult(person_id=None, similarity=0.3, threshold=0.45)
     assert r.person_id is None
     assert r.similarity < r.threshold
+
+
+def test_detected_face_carries_bbox_and_encoding():
+    enc = FaceEncoding(vector=np.ones(512, dtype=np.float32) / np.sqrt(512), model_version="buffalo_l")
+    df = DetectedFace(bbox=(10, 20, 100, 200), encoding=enc)
+    assert df.bbox == (10, 20, 100, 200)
+    assert df.encoding is enc

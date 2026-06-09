@@ -2,7 +2,7 @@ from typing import Protocol
 
 import numpy as np
 
-from face_recognition.domain.entities import FaceEncoding, Person, Template
+from face_recognition.domain.entities import DetectedFace, FaceEncoding, Person, Template
 
 
 class FacePipeline(Protocol):
@@ -16,6 +16,14 @@ class FacePipeline(Protocol):
 
     def encode_single(self, image: np.ndarray) -> FaceEncoding:
         """要求图中恰好 1 张脸；0 张或多张抛 NoFaceError / MultipleFacesError。"""
+        ...
+
+    def detect_and_encode(self, image: np.ndarray) -> list[DetectedFace]:
+        """实时场景用：返回带 bbox 的编码列表。
+
+        与 encode 的区别：encode 丢弃 bbox 信息，detect_and_encode 保留。
+        实时识别需要在画面上画框，所以必须拿到 bbox。
+        """
         ...
 
 
