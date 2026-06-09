@@ -1,7 +1,12 @@
-"""WebSocket 实时推流：JPEG 帧 + JSON 元数据。"""
+"""WebSocket 实时推流：JPEG 帧 + JSON 元数据。
+
+架构：主线程读帧→发送（流畅画面），后台线程跑检测识别（不卡画面）。
+"""
 
 import asyncio
 import logging
+import threading
+import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -21,13 +26,7 @@ router = APIRouter()
 
 @router.websocket("/ws/stream")
 async def websocket_stream(ws: WebSocket):
-    """实时推流：每帧发送 JPEG 二进制 + 识别结果 JSON。
-
-    画面和识别解耦：
-    - 每帧都读摄像头 + 渲染 + 发 JPEG（保证画面流畅）
-    - 隔 N 帧才跑一次 detect_and_encode（节省算力）
-    - 中间帧复用上一次的 tracks 画框
-    """
+    """实时推流：主线程只读帧+发送，后台线程异步跑检测。"""
     await ws.accept()
     logger.info("WebSocket 连接建立")
 
@@ -44,9 +43,30 @@ async def websocket_stream(ws: WebSocket):
         await ws.close()
         return
 
-    detect_interval = cfg.realtime.detect_every_n_frames
+    # 线程间共享状态
+    lock = threading.Lock()
+    latest_frame = None
     last_tracks: list = []
-    frame_idx = 0
+    running = True
+
+    def detect_loop():
+        """后台线程：每隔 detect_interval_ms 拿最新帧跑一次检测。"""
+        nonlocal latest_frame, last_tracks
+        interval = 1000 // max(cfg.camera.fps, 10)  # 约 100ms @30fps
+        while running:
+            with lock:
+                frame = latest_frame
+            if frame is not None:
+                try:
+                    tracks = use_case.process_frame(frame)
+                    with lock:
+                        last_tracks = tracks
+                except Exception as e:
+                    logger.warning(f"检测线程出错: {e}")
+            time.sleep(interval / 1000.0)
+
+    detect_thread = threading.Thread(target=detect_loop, daemon=True)
+    detect_thread.start()
 
     try:
         while True:
@@ -56,24 +76,18 @@ async def websocket_stream(ws: WebSocket):
                 await ws.send_json({"error": "CAMERA_LOST"})
                 break
 
-            frame_idx += 1
+            # 更新最新帧（检测线程会自己来拿）
+            with lock:
+                latest_frame = frame
+                current_tracks = list(last_tracks)
 
-            # 隔帧检测：只在第 1 帧和每 N 帧跑检测+识别
-            if frame_idx == 1 or frame_idx % detect_interval == 0:
-                last_tracks = use_case.process_frame(frame)
-
-            # 始终用最新 tracks 画框（无论是否跑了检测）
-            rendered = render_tracks(frame, last_tracks)
-
-            # 编码 JPEG
+            # 渲染 + 编码 + 发送（全部在主线程，快）
+            rendered = render_tracks(frame, current_tracks)
             jpeg_bytes = encode_jpeg(rendered, quality=cfg.realtime.jpeg_quality)
-
-            # 发送二进制 JPEG
             await ws.send_bytes(jpeg_bytes)
 
-            # 发送 JSON 元数据
             track_data = []
-            for t in last_tracks:
+            for t in current_tracks:
                 track_data.append({
                     "track_id": t.track_id,
                     "bbox": list(t.bbox),
@@ -82,7 +96,7 @@ async def websocket_stream(ws: WebSocket):
                 })
             await ws.send_json({"tracks": track_data, "threshold": use_case.threshold})
 
-            # 不 sleep：让摄像头按自己节奏出帧
+            # 让出 CPU 给事件循环处理 WebSocket 收发
             await asyncio.sleep(0)
 
     except WebSocketDisconnect:
@@ -90,4 +104,5 @@ async def websocket_stream(ws: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket 错误: {e}")
     finally:
+        running = False
         cam.release()
