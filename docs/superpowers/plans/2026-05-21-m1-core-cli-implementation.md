@@ -344,163 +344,78 @@ uv run pytest tests/unit/test_entities.py -v
 - [ ] **Step 3: 实现 `src/face_recognition/domain/entities.py`**
 
 ```python
-# dataclasses 是 Python 3.7+ 标准库，让定义"只装数据的类"少写一堆样板代码
-# 没有它你要手写 def __init__(self, x, y): self.x = x; self.y = y; ... 一长串
-# field 用于给字段加默认值工厂（default_factory），避免可变默认值被共享的坑
 from dataclasses import dataclass, field
-
-# datetime 类型用于 Template.created_at 字段
-# UTC 是 Python 3.11+ 的时区简写——等价于旧写法 datetime.timezone.utc
 from datetime import UTC, datetime
 
 import numpy as np
 
-# ===== 模块级常量 =====
-# 下划线开头是 Python 约定的"私有"标志，不会被 from xxx import * 导出
-_EMBED_DIM = 512                # ArcFace ResNet100 输出向量维度，buffalo_l 模型固定为 512
-_NORM_TOLERANCE = 1e-3          # L2 范数容忍度：理论 ||v||=1，浮点实际可能是 0.9999~1.0001 都接受
-# ── 给小白解释这个数 1e-3 ──
-#   Q1: 为什么是 1e-3 (= 0.001)？
-#       float32 的相对精度大约 1e-7；一次 L2 归一化 + SQLite BLOB 序列化往返 + 余弦点积，
-#       误差累积大约在 1e-4 量级。1e-3 比累积误差大一个数量级——给足"安全边距"，
-#       不会因正常浮点抖动而误判向量"没归一化"。
-#   Q2: 为什么不用 1e-6 或 1e-9？
-#       太严了。1e-6 比累积误差还小，会出现"理论上该过、实际偶尔抛 InvalidEncodingError"
-#       的玄学失败，调试起来非常痛苦。
-#   Q3: 为什么不用 1e-1？
-#       太松。L2 范数 0.9 还能过容忍——但 0.9 不是单位球面，余弦点积就不再等价于余弦
-#       相似度，下游所有阈值都失效。1e-3 是"够松到不抖、够严到不掩盖真 bug"的折中。
+_EMBED_DIM = 512
+_NORM_TOLERANCE = 1e-3
 
 
-# ===== FaceEncoding：领域层最核心的实体 =====
-# @dataclass 是装饰器，作用是给 class 自动生成几个常用方法：
-#   - __init__   构造函数（按字段顺序接参）
-#   - __repr__   打印表示（FaceEncoding(vector=..., model_version='buffalo_l')）
-#   - __eq__     相等比较
-# 不用它你要手写每一个，几十行的样板代码
-#
-# frozen=True 让实例创建后所有字段不可修改：
-#   - 给字段赋值会抛 dataclasses.FrozenInstanceError
-#   - 这正是"领域实体不可变"原则的代码体现——避免被外部代码偷偷改坏导致难追的 bug
 @dataclass(frozen=True)
 class FaceEncoding:
-    """ArcFace 对一张人脸输出的 512 维特征向量（已 L2 归一化）。
+    """ArcFace 输出的 512 维向量，已 L2 归一化。"""
 
-    设计要点：
-    - vector 必须 (512,) float32 且 ||v|| ≈ 1
-    - 归一化后两个 encoding 的余弦相似度 = 它们的点积，范围 [-1, 1]
-    - 这是整个识别系统的"通用货币"——所有相似度计算都基于它
-
-    "model_version" 字段记录这个向量是哪个模型出的；将来切换模型时
-    可以拒绝跨模型比对（比如 buffalo_l 的向量不能和 buffalo_s 的混着比）
-    """
-
-    # 用类型注解声明字段，dataclass 据此生成 __init__
-    # np.ndarray 是 NumPy 数组类型；shape/dtype 在 __post_init__ 中校验
-    vector: np.ndarray
-    # 给 model_version 设默认值 "buffalo_l"：绝大部分调用方不需要传这个参数，
-    # 只在"换了模型权重"这种罕见场景才需要显式覆盖
+    vector: np.ndarray  # shape=(512,), dtype=float32, ||v||=1
     model_version: str = "buffalo_l"
 
-    # __post_init__ 是 dataclass 提供的特殊方法：自动生成的 __init__ 跑完后会调用它
-    # 用途：在构造结束后做字段校验。如果字段不合法，抛异常拦截构造
-    # 这是"在系统边界做校验"的核心实践——非法实体根本无法存在
     def __post_init__(self) -> None:
-        # ndim 检查：防止传了 (1, 512) 或 (512, 1) 这种二维数组
         if self.vector.ndim != 1 or self.vector.shape[0] != _EMBED_DIM:
-            raise ValueError(
-                f"FaceEncoding 必须是 ({_EMBED_DIM},) 一维向量，收到 shape={self.vector.shape}"
-            )
-        # dtype 宽容处理：如果不是 float32 就静默转换（而非抛异常），
-        # 因为 numpy 默认 float64，外部库可能随手传了 float64——让调用方省心
+            raise ValueError(f"期望 {_EMBED_DIM} 维向量，收到 shape={self.vector.shape}")
         if self.vector.dtype != np.float32:
-            # frozen=True 下不能用 self.vector = ...，必须用 object.__setattr__
-            # 绕开 frozen 限制——这是 dataclass 约定俗成的后门
             object.__setattr__(self, "vector", self.vector.astype(np.float32))
-        # np.linalg.norm 默认计算 L2 范数（向量长度）
-        # float(...) 把 NumPy 标量转 Python 原生 float
-        #   - 避免后续 JSON 序列化、日志打印等场景遇到 numpy 类型的小麻烦
         norm = float(np.linalg.norm(self.vector))
         if abs(norm - 1.0) > _NORM_TOLERANCE:
-            # {norm:.4f} 是格式化指令——保留 4 位小数
-            raise ValueError(f"FaceEncoding 必须 L2 归一化（||v||=1），当前 ||v||={norm:.4f}")
+            raise ValueError(f"向量未 L2 归一化: ||v||={norm:.6f}，期望 1.0±{_NORM_TOLERANCE}")
 
-    # other 参数类型注解写成 "FaceEncoding"（带引号）的字符串
-    # 因为定义到这里时 FaceEncoding 这个名字还没"完全建好"，直接用会报错
-    # 用引号叫"前向引用（forward reference）"，Python 会延迟解析
     def cosine_similarity(self, other: "FaceEncoding") -> float:
-        """计算与另一个 FaceEncoding 的余弦相似度。
-
-        因为两个向量都已 L2 归一化，余弦相似度等价于它们的点积——
-        无需再除以范数（都是 1），省一步且更稳。
-        """
-        # np.dot 在两个一维数组上 = 它们的内积/点积 = sum(a[i] * b[i])
-        # 内积公式 vs 余弦相似度：cos = (a·b) / (||a||·||b||)
-        # 因为 ||a||=||b||=1，所以 cos = a·b（点积）
         return float(np.dot(self.vector, other.vector))
 
 
-# ===== Template：单条模板向量 =====
-# 一个 Person 可能有 1~50 条 Template，取决于使用的策略：
-#   - random_one / mean_all 策略：1 条
-#   - manual_three / kmeans_k3：3 条
-#   - all_vectors：N 条（注册集所有照片）
 @dataclass(frozen=True)
 class Template:
-    """单条模板向量。识别时把库内所有 Template 凑成一个矩阵做暴力检索。"""
+    """单条模板向量（一个 Person 可能有多条 Template）。"""
 
     encoding: FaceEncoding
-    source: str                 # 来源标识，如 "kmeans_centroid_0" / "raw_photo_3.jpg" / "mean"
-    # ── 给小白：为什么用 default_factory 而不是直接写 `= datetime.now(UTC)` ──
-    # 这是 Python 的经典坑：如果写 `created_at: datetime = datetime.now(UTC)`，
-    # 等号右边的表达式**在类定义时只执行一次**——所有 Template 实例会共享同一个时间戳！
-    # default_factory 接收一个无参函数，每次构造时调用，所以每一条 Template 拿到
-    # 各自独立的创建时间。这和 list/dict 默认参数不能用 [] 是同一个道理。
+    source: str  # "mean" / "subset_0_mean" / "kmeans_centroid_1" / "raw_0001.jpg"
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
-# ===== Person：领域聚合根 =====
-# 在领域驱动设计（DDD）中，"聚合根"是访问一组相关实体的唯一入口
-# 这里 Person 是访问其下所有 Template 的入口——你不能在系统中独立地存一个无主 Template
 @dataclass(frozen=True)
 class Person:
-    """库内人员 = 唯一 ID + 名字 + 多个模板向量。"""
+    """库内人员（领域聚合根）。"""
 
-    person_id: str              # 唯一 ID，本项目中直接用文件夹名（如 "alice"）
-    display_name: str           # 展示名，前端用
-    # tuple[Template, ...] 类型注解：含义是"任意长度的 Template 元组"
-    #   - 末尾的 ... 是 Ellipsis 字面量，表示"可变长"
-    #   - 用 tuple 而非 list：与 frozen=True 配合，让 Person 真正不可变
-    #     list 是可变容器（即使外层 frozen，list 内容仍可被偷偷改）
-    #     tuple 是不可变容器，外层加内层都不可变，消除一类 bug
+    person_id: str
+    display_name: str
     templates: tuple[Template, ...]
 
-    # @property 把方法伪装成属性——调用方可以写 p.template_count 而不用 p.template_count()
-    # CLI `list` 命令和前端"人员列表"都要显示"每人几个模板"，所以这是一个常用只读属性
     @property
     def template_count(self) -> int:
         return len(self.templates)
 
 
-# ===== RecognitionResult：识别用例的输出 =====
 @dataclass(frozen=True)
 class RecognitionResult:
-    """把识别决定 + 置信度 + 当时阈值打包返回。
+    """识别用例的输出。"""
 
-    为什么把 threshold 也放进结果里？
-    - 便于审计与日志：将来回看历史识别记录，能立即看出"当时用的阈值"
-    - 阈值会随着评估实验更新（spec §6 提到的 config.yaml 调整）
+    person_id: str | None  # None 表示未识别（库外陌生人）
+    similarity: float
+    threshold: float
+    matched_template_source: str | None = None  # 匹配到哪个模板
+
+
+@dataclass(frozen=True)
+class DetectedFace:
+    """一张人脸在某帧中的位置 + 编码。
+
+    实时场景使用：bbox 用于画框，encoding 用于查询模板矩阵。
+    M1 单图注册用 FaceEncoding 足够，不必关心 bbox。
     """
-
-    # str | None 是 PEP 604 联合类型语法（Python 3.10+ 支持）
-    #   - 等价于旧写法 Optional[str] 或 Union[str, None]
-    #   - None 表示未识别（库为空 / 最高相似度 < 阈值）
-    person_id: str | None
-    similarity: float           # 与最匹配模板的相似度，[-1, 1]
-    threshold: float            # 当时使用的阈值
-    # 匹配到的模板来源（如 "kmeans_centroid_1"），用于前端展示"谁 + 哪张模板"匹配的
-    # None = 库里没人 / 分数不够阈值——没有"最匹配"这回事
-    matched_template_source: str | None = None
+    # bbox 形式：(x1, y1, x2, y2) 整数像素坐标，左上 + 右下
+    # 用 tuple 而非 list：四个值一旦定下就不变，配合 frozen 保证不可变
+    bbox: tuple[int, int, int, int]
+    encoding: FaceEncoding
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -610,88 +525,61 @@ uv run pytest tests/unit/test_errors.py -v
 - [ ] **Step 3: 实现 `src/face_recognition/domain/errors.py`**
 
 ```python
-# Python 的所有异常都继承自内置 Exception 类
-# 自定义异常的标准做法：写一个 class，继承 Exception 即可
-# 这是整个项目领域异常的"祖先"——任何业务错误都应通过它的子类抛出
 class FaceRecognitionError(Exception):
-    """所有领域异常的基类。
+    """所有领域异常的基类。"""
 
-    用法：
-        try:
-            ...
-        except FaceRecognitionError as e:
-            print(e.code)  # 给前端的稳定错误码
-    """
-
-    # 类属性（class attribute）：所有实例共享同一个 code
-    # 子类可以覆盖它（写 code = "NO_FACE" 等）
-    # 类型注解 `code: str = "..."` 表示"code 是 str 类型，默认值 ..."
     code: str = "FACE_RECOGNITION_ERROR"
 
 
-# class Child(Parent): 表示 Child 继承自 Parent
-# 子类自动获得父类的所有属性和方法（除非显式覆盖）
 class NoFaceError(FaceRecognitionError):
-    """图中未检测到人脸时抛出。"""
+    """图像中未检测到人脸。"""
 
-    # 这里覆盖父类的 code 属性
-    # Python 的属性查找：先在子类找，找不到再去父类找——所以子类 code 会胜出
     code = "NO_FACE"
 
 
 class MultipleFacesError(FaceRecognitionError):
-    """图中检测到多张脸（注册/识别要求单脸）时抛出。"""
+    """图像中检测到多张人脸（encode_single 要求恰好一张）。"""
 
     code = "MULTIPLE_FACES"
 
-    # 显式定义 __init__ 接受额外参数 count
-    # 注意：父类 Exception 的 __init__ 接受 message 参数；这里我们想保留这能力 + 加 count
-    # message: str | None = None 是默认参数：调用时不传则为 None
-    def __init__(self, count: int, message: str | None = None) -> None:
-        # super().__init__(...) 调用父类（Exception）的构造函数
-        # 'super()' 是 Python 引用父类的标准方式
-        # 传给它的 message 会成为异常的"消息"，用 str(err) 能打印出来
-        # 'message or f"..."' 是 Python 习惯：message 真值时用 message，否则用 fallback
-        #   - None / 空字符串 / 0 / False / 空列表都算"假值"
+    def __init__(self, count: int = 0, message: str | None = None) -> None:
         super().__init__(message or f"检出 {count} 张脸（要求 1 张）")
-        # self.count 是实例属性，每个 MultipleFacesError 实例自己存一份
-        # 区别于上面的类属性 code（所有实例共享）
         self.count = count
 
 
-# 后续异常都是简单子类，只覆盖 code 即可——不需要额外字段或自定义 __init__
 class PersonNotFoundError(FaceRecognitionError):
-    """要查询/删除的 person_id 不在数据库时抛出。"""
+    """数据库中未找到指定人员。"""
+
     code = "PERSON_NOT_FOUND"
 
 
 class DuplicatePersonError(FaceRecognitionError):
-    """注册时 person_id 已存在（如要求"严格唯一"模式）时抛出。"""
+    """尝试注册已存在的人员。"""
+
     code = "DUPLICATE_PERSON"
 
 
 class LowConfidenceError(FaceRecognitionError):
-    """识别相似度低于阈值时使用——通常不抛而是返回 RecognitionResult(person_id=None)。
-    保留这个异常类型给将来如有"必须强匹配"的场景用。
-    """
+    """识别相似度低于阈值（保留给强制匹配场景）。"""
+
     code = "LOW_CONFIDENCE"
 
 
 class PersonHasNoTemplatesError(FaceRecognitionError):
-    """注册某人时所有照片都识别失败、一个模板都没生成的情况。"""
+    """人员没有任何模板向量。"""
+
     code = "NO_TEMPLATES"
 
 
 class CameraDisconnectedError(FaceRecognitionError):
-    """实时识别中摄像头中途断开。M4 阶段才会真正抛出，这里先定义好。"""
+    """摄像头断开连接。"""
+
     code = "CAMERA_LOST"
 
 
 class EncodingError(FaceRecognitionError):
-    """编码异常:模型输出零向量、L2 归一化分母为 0 等"模型本身坏了"的情况。
+    """编码异常：模型输出零向量、L2 归一化分母为 0 等模型问题。"""
 
-    与 NoFaceError(图里就没脸)区分:NoFaceError 是输入数据问题,EncodingError 是模型问题。
-    """
     code = "ENCODING_ERROR"
 ```
 
@@ -720,108 +608,67 @@ git commit -m "feat(domain): 加领域异常层次（NoFace/MultipleFaces/Person
 - [ ] **Step 1: 实现 `src/face_recognition/domain/interfaces.py`**
 
 ```python
-# typing.Protocol = "结构化子类型"协议，Python 3.8+ 引入。
-#   - 传统继承：class Dog(Animal)，必须显式声明继承关系才算 Animal
-#   - Protocol：只要一个类**长得像** Protocol（同名方法、同名签名），就算实现了它
-#   - 类比 Go 的 interface、Rust 的 trait（隐式实现）
-#   - 好处：domain 层不需要 import infrastructure（避免反向依赖），
-#          只要 SqliteRepository 定义了 add/get/... 方法签名匹配，类型检查就过
-#   - 对比 abc.ABC：ABC 强制继承，会让 domain 反向依赖到具体实现位置
-#
-# ── 给小白：3 行最小对比例子 ──
-#   # 传统 ABC（必须显式继承才算实现）：
-#   class Animal(ABC):
-#       @abstractmethod
-#       def speak(self) -> str: ...
-#   class Dog(Animal):           # ← 必须写 (Animal)
-#       def speak(self) -> str: return "汪"
-#
-#   # Protocol（只要方法名 + 签名一致就算）：
-#   class Speaker(Protocol):
-#       def speak(self) -> str: ...
-#   class Dog:                    # ← 不写继承
-#       def speak(self) -> str: return "汪"
-#   def call(s: Speaker) -> str: return s.speak()
-#   call(Dog())                   # ← 类型检查通过：Dog 长得像 Speaker
-#
-# 关键差异：用 Protocol 时 Dog 自己**完全不知道** Speaker 存在；用 ABC 时 Dog
-# 必须 import Animal 才能继承。本项目 SqliteRepository 不需要 import domain 的
-# Protocol——它只要把方法名/签名实现对就行——这正是清洁架构"依赖反转"的体现。
 from typing import Protocol
 
 import numpy as np
 
-# 从同包 entities 导入领域实体。注意这里的 import 路径用绝对导入
-# （from face_recognition.domain... 而不是 from .entities），
-# 是因为我们用 src layout 装成包，绝对导入更明确、IDE 跳转更稳。
-from face_recognition.domain.entities import (
-    FaceEncoding,
-    Person,
-    Template,
-)
+from face_recognition.domain.entities import DetectedFace, FaceEncoding, Person, Template
 
 
 class FacePipeline(Protocol):
-    # 模型版本字符串(如 "buffalo_l")。下游评估管线把它作为 FaceEncoding.model_version 写入,
-    # 避免在评估代码里硬编码字符串——换模型时只在 InsightFacePipeline 构造处改一处。
-    # 用属性而非方法:配置一次,运行期不变;Protocol 里写成裸属性即可。
+    """一站式人脸管线：检测 + 对齐 + 编码。"""
+
     model_version: str
 
-    # 方法体只写 ... （三个点，叫 Ellipsis 字面量），表示"什么都不做的占位"。
-    #   - 在 Protocol 里，方法体不会被执行，只用来声明签名
-    #   - 也可以写 pass，但 ... 是 Protocol/Stub 的社区惯例
-    # 这个方法约定："输入一张 BGR 图（OpenCV 读出来的 ndarray），返回所有人脸的 FaceEncoding 列表"
-    def encode(self, image: np.ndarray) -> list[FaceEncoding]: ...
+    def encode(self, image: np.ndarray) -> list[FaceEncoding]:
+        """返回图中所有人脸的编码（可能 0 个或多个）。"""
+        ...
 
-    # encode_single：注册流程用，要求图里**正好 1 张脸**，多于或少于都报错。
-    # 拆成两个方法：encode 给"识别 / 多人"用，encode_single 给"注册 / 单人"用，
-    # 调用方语义清晰，不用每次手动检查 len(faces)。
-    def encode_single(self, image: np.ndarray) -> FaceEncoding: ...
+    def encode_single(self, image: np.ndarray) -> FaceEncoding:
+        """要求图中恰好 1 张脸；0 张或多张抛 NoFaceError / MultipleFacesError。"""
+        ...
 
+    def detect_and_encode(self, image: np.ndarray) -> list[DetectedFace]:
+        """实时场景用：返回带 bbox 的编码列表。
 
-class PersonRepository(Protocol):
-    # 把"人脸库"抽象成增删改查 + 一个矩阵导出方法。
-    # 谁来实现？SqliteRepository（Task 6）。
-    # application/ 层只依赖这个 Protocol，永远不知道底层是 SQLite 还是别的。
-
-    def add(self, person: Person) -> None: ...
-
-    # 返回类型 `Person | None` 是 PEP 604 联合类型语法（Python 3.10+）。
-    #   - 旧写法：Optional[Person]，需要 from typing import Optional
-    #   - 新写法：直接 |，更像 TypeScript / Rust
-    # None 语义："没找到这个人"，由调用方决定怎么处理（不抛异常，因为"找不到"是预期路径）。
-    def get(self, person_id: str) -> Person | None: ...
-
-    # 区别：remove 找不到要**抛异常**（PersonNotFoundError），不返回 None。
-    # 为什么？删除是**有副作用**的命令，调用方期待"删了"或"明确失败"，
-    # 静默 no-op 容易掩盖 bug（比如拼错 person_id）。
-    def remove(self, person_id: str) -> None: ...
-
-    def list_all(self) -> list[Person]: ...
-
-    def all_templates_matrix(self) -> tuple[np.ndarray, list[str]]:
-        """返回 (M, 512) 模板矩阵 + 长度 M 的 person_id 列表（每行对应一个模板）
-
-        识别时关键性能优化：把所有模板拼成一个 (M, 512) 大矩阵，
-        和查询向量做一次矩阵乘法 (M, 512) @ (512,) → (M,)，得到 M 个相似度。
-        比"逐人遍历 + 逐模板算余弦"快 10x 以上（NumPy 底层用 BLAS）。
+        与 encode 的区别：encode 丢弃 bbox 信息，detect_and_encode 保留。
+        实时识别需要在画面上画框，所以必须拿到 bbox。
         """
         ...
 
 
+class PersonRepository(Protocol):
+    """人员向量库的抽象。"""
+
+    def add(self, person: Person) -> None:
+        """添加人员（如已存在则先删旧再插新，幂等）。"""
+        ...
+
+    def get(self, person_id: str) -> Person | None:
+        """按 ID 查询人员。"""
+        ...
+
+    def remove(self, person_id: str) -> None:
+        """按 ID 删除人员。"""
+        ...
+
+    def list_all(self) -> list[Person]:
+        """列出所有库内人员。"""
+        ...
+
+    def all_templates_matrix(self) -> tuple[np.ndarray, list[str]]:
+        """返回 (M, 512) 矩阵 + 长度 M 的 person_id 列表。"""
+        ...
+
+
 class TemplateStrategy(Protocol):
-    # Protocol 也可以声明**类属性**（不是方法）。这里要求实现类必须有 `name: str` 属性。
-    # 用途：CLI 拿 strategy.name 打日志、记录到数据库 source 字段。
+    """模板生成策略的统一接口。"""
+
     name: str
 
-    # build：核心方法。给一堆 FaceEncoding（一个人的所有照片），
-    # 返回若干 Template（库里实际存的模板向量）。
-    # - random_one  → 1 个 Template（随机选 1 张）
-    # - mean_all    → 1 个 Template（全部平均）
-    # - manual_three → 3 个
-    # - kmeans_k3   → 3 个（聚类质心）
-    # - all_vectors → N 个（全保留）
-    def build(self, encodings: list[FaceEncoding]) -> list[Template]: ...
+    def build(self, encodings: list[FaceEncoding]) -> list[Template]:
+        """从一组编码生成模板列表。"""
+        ...
 ```
 
 - [ ] **Step 2: 跑 mypy 验证类型协议正确**
@@ -2333,7 +2180,8 @@ uv run pytest tests/unit/test_register_face.py -v
 - [ ] **Step 3: 实现 `src/face_recognition/application/register_face.py`**
 
 ```python
-# Python 标准库的 logging。CLAUDE.md 第 2 节明确"用 basicConfig 即可，不上 loguru/structlog"。
+"""注册用例：从数据集目录批量注册人员到向量库。"""
+
 import logging
 from pathlib import Path
 
@@ -2342,35 +2190,16 @@ import numpy as np
 
 from face_recognition.domain.entities import FaceEncoding, Person, Template
 from face_recognition.domain.errors import MultipleFacesError, NoFaceError
-from face_recognition.domain.interfaces import (
-    FacePipeline,
-    PersonRepository,
-    TemplateStrategy,
-)
+from face_recognition.domain.interfaces import FacePipeline, PersonRepository, TemplateStrategy
 
-# logging.getLogger(__name__) 标准用法：
-#   - __name__ = 当前模块的全限定名（如 "face_recognition.application.register_face"）
-#   - 同一模块多次 getLogger 返回**同一个**实例（logger 是单例工厂）
-#   - 这样不同模块的日志会带不同前缀，便于过滤和定位
 logger = logging.getLogger(__name__)
 
-# manual_three 策略的子文件夹名（与 prepare_lfw_dataset.py 脚本约定一致）
+# 与 manual_three 策略约定的子文件夹名
 SUBSET_DIRS = ["subset_0", "subset_1", "subset_2"]
 
 
 class RegisterFace:
-    """用例（use case）：表达一个完整的业务动作 = "注册一批人脸到库里"。
-
-    依赖通过构造函数注入（DI），不在内部 new。这就是为什么测试可以传 FakePipeline：
-    用例不知道 pipeline 是真模型还是假对象，只要符合 Protocol 即可。
-
-    和 plan 教学版的区别：
-    - 去掉了 `image_loader` 注入——生产代码直接用 cv2.imread，没必要把"读文件"
-      这种标准库操作也做成依赖。测试用真实 jpg 文件（tmp_path 写一张 112×112 黑图）
-      比 mock 一个 lambda 更直白、更贴近真实场景。
-    - `execute()` 返回 `dict` 而非 `RegisterSummary`——简单统计用 dict 够用，
-      加一个 frozen dataclass 只多一次拆包/属性访问的开销，不值。
-    """
+    """注册用例：遍历数据集目录，为每人编码并存入向量库。"""
 
     def __init__(
         self,
@@ -2384,17 +2213,13 @@ class RegisterFace:
 
     def execute(self, dataset_dir: str | Path) -> dict:
         """
-        批量注册整个数据集。返回统计 dict 供 CLI 展示。
+        批量注册。
 
         Args:
             dataset_dir: 数据集根目录，结构为 <dataset_dir>/<person_name>/*.jpg
 
         Returns:
             {"success": int, "skipped": int, "total_photos": int, "skipped_photos": int}
-            ── 为什么用 dict 而非 dataclass ──
-            注册统计只有 4 个 int 字段，不需要类型安全也不需要传递到多个地方。
-            CLI 拿到直接 f-string 拼输出，dict 够用。dataclass 是给"跨层传递的值对象"
-            （如 FaceEncoding、RecognitionResult）准备的，不是给"一次性统计"准备的。
         """
         dataset_dir = Path(dataset_dir)
         if not dataset_dir.is_dir():
@@ -2404,7 +2229,7 @@ class RegisterFace:
 
         for person_dir in sorted(dataset_dir.iterdir()):
             if not person_dir.is_dir():
-                continue  # 跳过 README.md、.DS_Store 等非目录条目
+                continue
 
             person_id = person_dir.name
             try:
@@ -2413,8 +2238,6 @@ class RegisterFace:
                 stats["success"] += 1
                 logger.info(f"注册成功: {person_id} ({person.template_count} 个模板)")
             except ValueError as e:
-                # 单人失败时**不向上传播**——只记 error 然后继续下一个人。
-                # 这是"批处理容错"的标准做法：1 个人挂了不连累整批。
                 stats["skipped"] += 1
                 logger.error(f"跳过 {person_id}: {e}")
 
@@ -2427,12 +2250,11 @@ class RegisterFace:
         return stats
 
     def _register_person(self, person_dir: Path, person_id: str) -> Person:
-        """注册单个人：加载图片 → 编码 → 策略压缩 → 包装成 Person 返回。"""
-        # 检测是否为 manual_three 策略且存在子文件夹——是则走分组路径
+        """注册单个人。"""
+        # 检测是否为 manual_three 策略且存在子文件夹
         if self.strategy.name == "manual_three" and self._has_subsets(person_dir):
             templates = self._build_manual_templates(person_dir)
         else:
-            # —— 扁平路径（其它 4 种策略）──
             images = self._load_images(person_dir)
             encodings = self._encode_images(images, person_dir)
             if not encodings:
@@ -2446,16 +2268,14 @@ class RegisterFace:
         )
 
     def _has_subsets(self, person_dir: Path) -> bool:
-        """检查 person_dir 是否包含 manual_three 所需的子文件夹结构。"""
         return (person_dir / "subset_0").is_dir()
 
     def _build_manual_templates(self, person_dir: Path) -> list[Template]:
-        """manual_three 专用：从子文件夹分组编码，调用 build_from_groups。"""
+        """manual_three 专用：从子文件夹分组编码。"""
         from face_recognition.application.strategies.manual_three import (
             ManualThreeStrategy,
         )
 
-        # 确保 strategy 是 ManualThreeStrategy 实例（防御性 cast）
         strategy = self.strategy
         if not isinstance(strategy, ManualThreeStrategy):
             strategy = ManualThreeStrategy()
@@ -2468,35 +2288,58 @@ class RegisterFace:
                 encodings = self._encode_images(images, subset_dir)
                 groups.append(encodings)
             else:
-                groups.append([])  # 子文件夹不存在 → 空组，build_from_groups 内部跳过
+                groups.append([])
 
-        # build_from_groups：每组取均值 → 3 个模板；空组自动跳过
         return strategy.build_from_groups(groups)
 
     def _load_images(self, directory: Path) -> list[np.ndarray]:
-        """加载目录下所有图片（支持 jpg/png，跳过子文件夹）。
-
-        ── 给小白：为什么用 glob 而非 iterdir + set ──
-        glob 会自动按文件名字典序排序（sorted() 的效果），且一次调用只拿匹配后缀的文件。
-        用 iterdir 要手动过滤扩展名 + 手动排序，多写几行但无收益。glob 一行搞定。
-        """
+        """加载目录下所有图片（支持 jpg/png，跳过子文件夹）。"""
         images = []
         for ext in ("*.jpg", "*.jpeg", "*.png"):
             for img_path in sorted(directory.glob(ext)):
                 img = cv2.imread(str(img_path))
-                if img is not None:  # imread 失败不抛异常，返回 None
+                if img is not None:
                     images.append(img)
         return images
+
+    def register_from_frames(
+        self,
+        person_id: str,
+        display_name: str,
+        frames: list[np.ndarray],
+    ) -> Person:
+        """从内存帧列表注册（HTTP 上传场景）。
+
+        与 execute 的区别：
+          - 输入是已解码的 ndarray 列表（不是磁盘路径）
+          - 直接返回 Person 给上层做响应序列化
+        """
+        encodings: list[FaceEncoding] = []
+        for idx, frame in enumerate(frames):
+            try:
+                enc = self.pipeline.encode_single(frame)
+                encodings.append(enc)
+            except (NoFaceError, MultipleFacesError) as e:
+                logger.warning("跳过第 %d 张: %s", idx, e)
+
+        if not encodings:
+            raise ValueError(
+                f"{person_id}: 上传的 {len(frames)} 张全部无法提取人脸"
+            )
+
+        templates = self.strategy.build(encodings)
+        person = Person(
+            person_id=person_id,
+            display_name=display_name,
+            templates=tuple(templates),
+        )
+        self.repository.add(person)
+        return person
 
     def _encode_images(
         self, images: list[np.ndarray], source_dir: Path
     ) -> list[FaceEncoding]:
-        """批量编码图片，单张失败记 warning 跳过（不中断整批）。
-
-        ── 给小白：为什么单张失败不抛异常 ──
-        私人数据集里常有合影、侧脸、戴口罩——SCRFD 检测不到脸是正常情况。
-        如果一张失败就整人注册失败，用户体验很糟。记 warning 跳过是对真实数据集的务实态度。
-        """
+        """批量编码图片，单张失败记 warning 跳过。"""
         encodings = []
         for i, img in enumerate(images):
             try:
@@ -2617,6 +2460,8 @@ uv run pytest tests/unit/test_recognize_face.py -v
 - [ ] **Step 3: 实现 `src/face_recognition/application/recognize_face.py`**
 
 ```python
+"""识别用例：对单张图片进行开放集人脸识别。"""
+
 import logging
 
 import numpy as np
@@ -2628,18 +2473,7 @@ logger = logging.getLogger(__name__)
 
 
 class RecognizeFace:
-    """识别用例：1 张图 → 提取向量 → 与库内所有模板比 → 阈值判别。
-
-    核心算法：余弦相似度 = 单位向量点积。因为我们保证所有向量都 L2 归一化，
-    所以"余弦相似度" ≡ "点积"。识别整库 = 一次矩阵乘法。
-
-    和 plan 教学版的区别（为何加了缓存层）：
-    - 教学版每次 `execute()` 都从 SQLite 重新加载全量模板矩阵。这在单次评估时
-      完全够用，但在 M4 WebSocket 实时流里——每秒 3~5 帧识别请求——每次 SQLite
-      往返 + BLOB 反序列化的开销不可接受（≈15ms/次 × 5fps = 75ms 纯 I/O）。
-    - 生产版加了 `_templates_matrix` 内存缓存，`refresh_cache()` 只在增删人员
-      后由调用方（dependencies 装配 / CLI 命令）显式触发。识别热路径只做矩阵乘法。
-    """
+    """识别用例：给定图片，返回最匹配的库内人员或 None（库外陌生人）。"""
 
     def __init__(
         self,
@@ -2651,33 +2485,22 @@ class RecognizeFace:
         self.repository = repository
         self.threshold = threshold
         # 缓存模板矩阵和 person_id 列表（注册后需刷新）
-        # None = 尚未加载，由 _ensure_cache() 延迟初始化
         self._templates_matrix: np.ndarray | None = None
         self._person_ids: list[str] | None = None
 
     def refresh_cache(self) -> None:
-        """刷新模板矩阵缓存（增删人员后调用）。
-
-        ── 给小白：为什么叫 refresh_cache 而不是 load_cache ──
-        "refresh"暗示"已有数据被新数据替换"，比"load"更精确地表达了
-        缓存失效→重新加载的语义。这是行业惯例命名（`cache.refresh()`）。
-        """
+        """刷新模板矩阵缓存（增删人员后调用）。"""
         self._templates_matrix, self._person_ids = (
             self.repository.all_templates_matrix()
         )
 
     def _ensure_cache(self) -> None:
-        """延迟加载：首次识别时才从 SQLite 拉模板（而非构造时立刻拉）。
-
-        好处：如果构造了 RecognizeFace 但从未调用（如测试 setup），
-        不会触发不必要的 SQLite I/O。
-        """
         if self._templates_matrix is None or self._person_ids is None:
             self.refresh_cache()
 
     def execute(self, image: np.ndarray) -> RecognitionResult:
         """
-        对单张图片执行识别（允许多脸——取第一张脸）。
+        对单张图片执行识别。
 
         Args:
             image: BGR 格式图像（np.ndarray）
@@ -2685,8 +2508,6 @@ class RecognizeFace:
         Returns:
             RecognitionResult，person_id 为 None 表示库外陌生人
         """
-        # 用 encode() 而非 encode_single()：允许图中多张脸，取第一张
-        # 这对实时摄像头场景很重要——画面边缘可能闯入第二张脸
         encodings = self.pipeline.encode(image)
         if not encodings:
             return RecognitionResult(
@@ -2701,24 +2522,17 @@ class RecognizeFace:
 
     def execute_single(self, image: np.ndarray) -> RecognitionResult:
         """
-        要求图中恰好一张脸，否则抛异常（NoFaceError / MultipleFacesError）。
-
-        CLI `recognize` 命令用这个——单张照片识别，多脸就是异常。
+        要求图中恰好一张脸，否则抛异常。
         """
         query = self.pipeline.encode_single(image)
         return self._match(query)
 
     def _match(self, query: FaceEncoding) -> RecognitionResult:
-        """核心匹配逻辑：矩阵乘法一次拿到所有模板的相似度，取最大值判阈值。
-
-        提取为独立方法让 execute() 和 execute_single() 共用同一段匹配逻辑——
-        "从向量到结果"是纯计算，不关心向量来自单脸还是多脸的第一张。
-        """
+        """矩阵乘法一次得到所有模板的相似度，取最大值。"""
         self._ensure_cache()
         assert self._templates_matrix is not None
         assert self._person_ids is not None
 
-        # 库为空（未注册任何人）：(0, 512) 矩阵，argmax 会抛 ValueError
         if self._templates_matrix.shape[0] == 0:
             return RecognitionResult(
                 person_id=None,
@@ -2726,16 +2540,9 @@ class RecognizeFace:
                 threshold=self.threshold,
             )
 
-        # 核心计算——一次矩阵乘法搞定所有相似度。
-        # `matrix @ enc.vector` 是 Python 3.5+ 的"矩阵乘法运算符"（@），
-        # 等价于 np.matmul(matrix, enc.vector) 或 matrix.dot(enc.vector)。
-        # 形状变化：(M, 512) @ (512,) = (M,)
-        # 每个元素 sims[i] = matrix[i] · query.vector = 第 i 个模板与查询的余弦相似度
-        # （因为两者都已 L2 归一化，所以点积 = cos θ）。
+        # (M, 512) @ (512,) → (M,)
         similarities = self._templates_matrix @ query.vector
-        # np.argmax(arr) = 返回最大值的索引（int 类型）
         best_idx = int(np.argmax(similarities))
-        # numpy 标量转 Python float，让类型注解干净
         best_sim = float(similarities[best_idx])
 
         if best_sim >= self.threshold:
@@ -2744,12 +2551,12 @@ class RecognizeFace:
                 similarity=best_sim,
                 threshold=self.threshold,
             )
-        # 仍然返回 best_sim（不是 0），方便上层日志展示"虽然没认出但最高也只有 0.42"
-        return RecognitionResult(
-            person_id=None,
-            similarity=best_sim,
-            threshold=self.threshold,
-        )
+        else:
+            return RecognitionResult(
+                person_id=None,
+                similarity=best_sim,
+                threshold=self.threshold,
+            )
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -2851,80 +2658,86 @@ def test_encode_no_face_raises(pipeline: InsightFacePipeline):
 - [ ] **Step 2: 实现 `src/face_recognition/infrastructure/insightface_pipeline.py`**
 
 ```python
-import numpy as np
-# insightface.app.FaceAnalysis 是 InsightFace 官方提供的"一站式管线"：
-#   detect 检测 → 5 点关键点 → 仿射对齐 → ArcFace ResNet100 出 512 维向量。
-# 我们整个项目唯一允许 import insightface 的文件就是这里——见 CLAUDE.md 第 3 节。
-from insightface.app import FaceAnalysis
+"""InsightFace buffalo_l 一站式管线：检测 + 关键点对齐 + 编码。"""
 
-from face_recognition.domain.entities import FaceEncoding
-from face_recognition.domain.errors import EncodingError, MultipleFacesError, NoFaceError
+import logging
+
+import numpy as np
+
+from face_recognition.domain.entities import DetectedFace, FaceEncoding
+from face_recognition.domain.errors import MultipleFacesError, NoFaceError
+
+logger = logging.getLogger(__name__)
 
 
 class InsightFacePipeline:
-    """实现 domain/interfaces.py 的 FacePipeline Protocol。
-
-    封装 buffalo_l 模型的"加载 + 推理"两个动作。所有 InsightFace 接口
-    细节都关进这个类，外部只看 encode/encode_single 两个方法。
-    """
+    """封装 InsightFace buffalo_l，实现 FacePipeline 协议。"""
 
     def __init__(
         self,
-        model_pack: str = "buffalo_l",
+        pack: str = "buffalo_l",
         ctx_id: int = 0,
         det_size: tuple[int, int] = (640, 640),
-    ) -> None:
-        self._model_pack = model_pack
-        # 暴露给 FacePipeline Protocol 的 model_version 属性。
-        # 评估侧用它构造 FaceEncoding,避免硬编码 "buffalo_l"。
-        self.model_version = model_pack
-        # FaceAnalysis(name="buffalo_l") = 选择模型组合包。
-        # 首次调用会自动从云端下载到 ~/.insightface/models/ 缓存（约 300MB）。
-        self._app = FaceAnalysis(name=model_pack)
-        # prepare = "把模型加载到设备上准备推理"。
-        # ctx_id：0/1/2... 选 GPU 卡号；-1 走 CPU。
-        # det_size：检测器输入分辨率，越大检测越准但越慢。
-        # 这一步耗时（CPU 上 1~3s），所以只在 __init__ 调一次。
-        self._app.prepare(ctx_id=ctx_id, det_size=det_size)
+    ):
+        import insightface
+
+        self.pack = pack
+        self.model_version = pack
+        self.app = insightface.app.FaceAnalysis(
+            name=pack,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        self.app.prepare(ctx_id=ctx_id, det_size=det_size)
+        logger.info(
+            f"InsightFace {pack} 加载完成 (ctx_id={ctx_id}, det_size={det_size})"
+        )
 
     def encode(self, image: np.ndarray) -> list[FaceEncoding]:
-        """识别多张脸（实时识别用）。给一张可能含多人的图，返回每张脸的 encoding。"""
-        # FaceAnalysis.get(img) = 一次性跑完整个流水线，返回 Face 对象列表。
-        # 每个 Face 对象有 .bbox（边框）/.kps（关键点）/.embedding（向量）/.det_score（置信度）等属性
-        faces = self._app.get(image)
+        """
+        返回图中所有人脸的编码（已 L2 归一化）。
+        BGR 格式输入，输出按检测置信度降序排列。
+        """
+        faces = self.app.get(image)
         return [
             FaceEncoding(
-                # f.embedding 是原始 numpy 数组，转 float32 + L2 归一化
                 vector=self._normalize(f.embedding.astype(np.float32)),
-                model_version=self._model_pack,
+                model_version=self.pack,
             )
             for f in faces
         ]
 
     def encode_single(self, image: np.ndarray) -> FaceEncoding:
-        """注册时用：图里**必须正好 1 张脸**，多于或少于都是异常情况。"""
-        faces = self._app.get(image)
-        if not faces:
-            raise NoFaceError("图中未检出人脸")
+        """要求图中恰好 1 张脸。"""
+        faces = self.app.get(image)
+        if len(faces) == 0:
+            raise NoFaceError("未检测到人脸")
         if len(faces) > 1:
             raise MultipleFacesError(count=len(faces))
-        emb = faces[0].embedding.astype(np.float32)
         return FaceEncoding(
-            vector=self._normalize(emb), model_version=self._model_pack
+            vector=self._normalize(faces[0].embedding.astype(np.float32)),
+            model_version=self.pack,
         )
 
-    # @staticmethod = 静态方法，不接收 self / cls，调用时不需要实例。
-    # 这里 _normalize 不依赖任何实例字段，纯函数 → 标记为 static 让意图更清晰。
     @staticmethod
-    def _normalize(v: np.ndarray) -> np.ndarray:
-        n = np.linalg.norm(v)
-        # 1e-12 是非常严格的"接近 0"判定。InsightFace 正常输出永远不会是零向量，
-        # 出现 → 模型加载失败或输入有严重问题，应立即报错而非除以 0 出 NaN。
-        if n < 1e-12:
-            # 用领域异常而非裸 ValueError,与 errors.py 异常层次一致——
-            # 上层全局 handler/CLI 可以按 FaceRecognitionError 基类统一捕获。
-            raise EncodingError("InsightFace 输出零向量,模型异常")
-        return v / n
+    def _normalize(vector: np.ndarray) -> np.ndarray:
+        """L2 归一化：InsightFace 原始 embedding 未归一化，需手动归一化。"""
+        norm = np.linalg.norm(vector)
+        if norm < 1e-10:
+            raise ValueError("向量范数接近零")
+        return vector / norm
+
+    def detect_and_encode(self, image: np.ndarray) -> list[DetectedFace]:
+        """同 encode，但保留 InsightFace 的 bbox（int4 像素坐标）。"""
+        faces = self.app.get(image)
+        out: list[DetectedFace] = []
+        for f in faces:
+            x1, y1, x2, y2 = f.bbox.astype(int).tolist()
+            enc = FaceEncoding(
+                vector=self._normalize(f.embedding.astype(np.float32)),
+                model_version=self.pack,
+            )
+            out.append(DetectedFace(bbox=(x1, y1, x2, y2), encoding=enc))
+        return out
 ```
 
 - [ ] **Step 3: 跑集成测试（首次会下载 buffalo_l 模型，约 300MB）**

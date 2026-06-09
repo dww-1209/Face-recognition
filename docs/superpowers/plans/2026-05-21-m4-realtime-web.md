@@ -545,7 +545,6 @@ class CameraCapture:
         resolution: tuple[int, int],
         cap_factory: _CapFactory = cv2.VideoCapture,
     ) -> None:
-        # 懒得把 cv2.VideoCapture 写死——cap_factory 让测试可以注入 mock
         self._cap = cap_factory(device_index)
         if not self._cap.isOpened():
             raise CameraDisconnectedError(f"摄像头 {device_index} 无法打开")
