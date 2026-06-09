@@ -2324,6 +2324,8 @@ import logging
 import threading
 import time
 
+import cv2
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from face_recognition.api.dependencies import (
@@ -2366,9 +2368,8 @@ async def websocket_stream(ws: WebSocket):
     running = True
 
     def detect_loop():
-        """后台线程：每隔 detect_interval_ms 拿最新帧跑一次检测。"""
+        """后台线程：每隔 200ms 拿最新帧跑一次检测（5fps 够跟踪用了）。"""
         nonlocal latest_frame, last_tracks
-        interval = 1000 // max(cfg.camera.fps, 10)  # 约 100ms @30fps
         while running:
             with lock:
                 frame = latest_frame
@@ -2379,25 +2380,33 @@ async def websocket_stream(ws: WebSocket):
                         last_tracks = tracks
                 except Exception as e:
                     logger.warning(f"检测线程出错: {e}")
-            time.sleep(interval / 1000.0)
+            time.sleep(0.2)  # 200ms → 每秒 5 次检测
 
     detect_thread = threading.Thread(target=detect_loop, daemon=True)
     detect_thread.start()
 
     try:
         while True:
+            # cam.read() 是同步阻塞调用——必须放进线程池，否则
+            # 事件循环被卡住，收不到 WebSocket 关闭信号（导致
+            # 摄像头释放延迟，绿灯常亮）。
             try:
-                frame = cam.read()
+                frame = await asyncio.to_thread(cam.read)
             except CameraDisconnectedError:
                 await ws.send_json({"error": "CAMERA_LOST"})
                 break
+
+            # macOS 上 cv2.set 改分辨率无效，手动缩到 640 保证流畅
+            h, w = frame.shape[:2]
+            if w > 640:
+                frame = cv2.resize(frame, (640, int(h * 640 / w)))
 
             # 更新最新帧（检测线程会自己来拿）
             with lock:
                 latest_frame = frame
                 current_tracks = list(last_tracks)
 
-            # 渲染 + 编码 + 发送（全部在主线程，快）
+            # 渲染 + 编码 + 发送
             rendered = render_tracks(frame, current_tracks)
             jpeg_bytes = encode_jpeg(rendered, quality=cfg.realtime.jpeg_quality)
             await ws.send_bytes(jpeg_bytes)
@@ -2412,16 +2421,15 @@ async def websocket_stream(ws: WebSocket):
                 })
             await ws.send_json({"tracks": track_data, "threshold": use_case.threshold})
 
-            # 让出 CPU 给事件循环处理 WebSocket 收发
-            await asyncio.sleep(0)
-
     except WebSocketDisconnect:
-        logger.info("WebSocket 断开")
+        logger.info("WebSocket 断开，正在释放摄像头...")
     except Exception as e:
         logger.error(f"WebSocket 错误: {e}")
     finally:
         running = False
+        logger.info("释放摄像头...")
         cam.release()
+        logger.info("摄像头已释放")
 ```
 
 - [ ] **Step 3: 在 server.py 注册路由（mount StaticFiles 之前）**
