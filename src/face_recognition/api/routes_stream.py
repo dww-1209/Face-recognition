@@ -69,22 +69,16 @@ async def websocket_stream(ws: WebSocket):
     detect_thread = threading.Thread(target=detect_loop, daemon=True)
     detect_thread.start()
 
-    t_last = time.perf_counter()
-    frame_count = 0
     try:
         while True:
+            # cam.read() 是同步阻塞调用——必须放进线程池，否则
+            # 事件循环被卡住，收不到 WebSocket 关闭信号（导致
+            # 摄像头释放延迟，绿灯常亮）。
             try:
-                frame = cam.read()
+                frame = await asyncio.to_thread(cam.read)
             except CameraDisconnectedError:
                 await ws.send_json({"error": "CAMERA_LOST"})
                 break
-
-            t_now = time.perf_counter()
-            dt = (t_now - t_last) * 1000
-            t_last = t_now
-            frame_count += 1
-            if frame_count % 30 == 0:
-                logger.info(f"帧间隔: {dt:.0f}ms (≈{1000/dt:.0f}fps)")
 
             # macOS 上 cv2.set 改分辨率无效，手动缩到 640 保证流畅
             h, w = frame.shape[:2]
@@ -112,9 +106,11 @@ async def websocket_stream(ws: WebSocket):
             await ws.send_json({"tracks": track_data, "threshold": use_case.threshold})
 
     except WebSocketDisconnect:
-        logger.info("WebSocket 断开")
+        logger.info("WebSocket 断开，正在释放摄像头...")
     except Exception as e:
         logger.error(f"WebSocket 错误: {e}")
     finally:
-        running = False  # 通知检测线程停止（daemon，进程结束自动回收）
-        cam.release()    # 检测线程不碰摄像头，直接释放不冲突
+        running = False
+        logger.info("释放摄像头...")
+        cam.release()
+        logger.info("摄像头已释放")
