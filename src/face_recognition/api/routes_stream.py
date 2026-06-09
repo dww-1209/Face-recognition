@@ -116,5 +116,5 @@ async def websocket_stream(ws: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket 错误: {e}")
     finally:
-        running = False
-        cam.release()
+        running = False  # 通知检测线程停止（daemon，进程结束自动回收）
+        cam.release()    # 检测线程不碰摄像头，直接释放不冲突
