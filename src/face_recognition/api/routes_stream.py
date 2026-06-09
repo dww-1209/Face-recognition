@@ -52,9 +52,8 @@ async def websocket_stream(ws: WebSocket):
     running = True
 
     def detect_loop():
-        """后台线程：每隔 detect_interval_ms 拿最新帧跑一次检测。"""
+        """后台线程：每隔 200ms 拿最新帧跑一次检测（5fps 够跟踪用了）。"""
         nonlocal latest_frame, last_tracks
-        interval = 1000 // max(cfg.camera.fps, 10)  # 约 100ms @30fps
         while running:
             with lock:
                 frame = latest_frame
@@ -65,11 +64,13 @@ async def websocket_stream(ws: WebSocket):
                         last_tracks = tracks
                 except Exception as e:
                     logger.warning(f"检测线程出错: {e}")
-            time.sleep(interval / 1000.0)
+            time.sleep(0.2)  # 200ms → 每秒 5 次检测
 
     detect_thread = threading.Thread(target=detect_loop, daemon=True)
     detect_thread.start()
 
+    t_last = time.perf_counter()
+    frame_count = 0
     try:
         while True:
             try:
@@ -77,6 +78,13 @@ async def websocket_stream(ws: WebSocket):
             except CameraDisconnectedError:
                 await ws.send_json({"error": "CAMERA_LOST"})
                 break
+
+            t_now = time.perf_counter()
+            dt = (t_now - t_last) * 1000
+            t_last = t_now
+            frame_count += 1
+            if frame_count % 30 == 0:
+                logger.info(f"帧间隔: {dt:.0f}ms (≈{1000/dt:.0f}fps)")
 
             # macOS 上 cv2.set 改分辨率无效，手动缩到 640 保证流畅
             h, w = frame.shape[:2]
@@ -88,7 +96,7 @@ async def websocket_stream(ws: WebSocket):
                 latest_frame = frame
                 current_tracks = list(last_tracks)
 
-            # 渲染 + 编码 + 发送（全部在主线程，快）
+            # 渲染 + 编码 + 发送
             rendered = render_tracks(frame, current_tracks)
             jpeg_bytes = encode_jpeg(rendered, quality=cfg.realtime.jpeg_quality)
             await ws.send_bytes(jpeg_bytes)
@@ -102,9 +110,6 @@ async def websocket_stream(ws: WebSocket):
                     "similarity": round(t.similarity, 4),
                 })
             await ws.send_json({"tracks": track_data, "threshold": use_case.threshold})
-
-            # 让出 CPU 给事件循环处理 WebSocket 收发
-            await asyncio.sleep(0)
 
     except WebSocketDisconnect:
         logger.info("WebSocket 断开")
