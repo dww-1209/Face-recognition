@@ -2314,233 +2314,99 @@ def test_ws_accepts_connection(monkeypatch):
 - [ ] **Step 2: 写实现**
 
 ```python
-# src/face_recognition/api/routes_stream.py
-"""WebSocket 实时识别推流。
+"""WebSocket 实时推流：JPEG 帧 + JSON 元数据。"""
 
-线程模型：
-    每个 WebSocket 连接独占：
-        - 1 个 CameraCapture（独占摄像头——同一时刻只能 1 个连接）
-        - 1 个识别线程（capture.read → process_frame → renderer → queue）
-        - 1 个 async 主任务（从 queue 取帧 → ws.send_bytes/send_text）
-    断开时 stop_event.set，线程自杀，capture.release。
-
-为什么用线程而不是 asyncio：
-    cv2 + InsightFace 都是同步阻塞 API，强行用 asyncio 要包 run_in_executor 反而更乱。
-    用一个独立线程同步循环最简单。FastAPI 主进程仍然是 asyncio，两者通过 queue.Queue 通信。
-"""
 import asyncio
-import json
 import logging
-import queue
-import threading
-from dataclasses import asdict
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from face_recognition.api.dependencies import (
     build_recognize_frame_use_case,
     get_config,
+    get_pipeline,
 )
-from face_recognition.infrastructure.camera_capture import CameraCapture, CameraDisconnectedError
-from face_recognition.infrastructure.frame_renderer import render_tracks, encode_jpeg
+from face_recognition.domain.errors import CameraDisconnectedError
+from face_recognition.infrastructure.camera_capture import CameraCapture
+from face_recognition.infrastructure.frame_renderer import encode_jpeg, render_tracks
 
 logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
-def _recognition_loop(
-    capture: CameraCapture,
-    use_case,
-    out_queue: queue.Queue,
-    stop_event: threading.Event,
-    jpeg_quality: int,
-) -> None:
-    """识别线程主循环。
+@router.websocket("/ws/stream")
+async def websocket_stream(ws: WebSocket):
+    """实时推流：每帧发送 JPEG 二进制 + 识别结果 JSON。
 
-    每帧产出：(jpeg_bytes, metadata_dict)
-    丢进 queue 给 async 任务；满了就丢老的（防止前端慢导致延迟堆积）。
-
-    ── 给小白：threading 三件套 ──
-    Q1: `out_queue: queue.Queue` 是什么？
-        Python 标准库的**线程安全 FIFO 队列**——多线程同时 put/get 不会乱。内部已加
-        锁，调用者不需要自己上锁。常用方法：
-          - `q.put(item)` / `q.get()`：满或空时**阻塞**等待
-          - `q.put_nowait(item)` / `q.get_nowait()`：满或空时**立即抛**
-            `queue.Full` / `queue.Empty`，不阻塞
-          - `q.qsize()`：当前元素数（多线程下只是估计值）
-        本项目识别线程把 (jpeg, meta) 放进队列，async ws 任务从队列拿出来推给浏览器。
-        `maxsize=2` 限制缓冲深度——超过就丢老帧（见下方 except queue.Full 块），避免
-        前端慢导致老帧堆积、延迟越来越大。
-    Q2: `stop_event: threading.Event` 是什么？
-        跨线程的**布尔信号灯**，三件套：
-          - `event.set()`：点亮（标记为 True）
-          - `event.clear()`：熄灭
-          - `event.is_set()`：查状态（线程安全）
-          - `event.wait(timeout)`：阻塞等到点亮，可设超时
-        线程主循环写 `while not stop_event.is_set(): ...` 是**优雅退出**的标准模式：
-        外部线程在合适时机 `set()` 一下，本线程跑完当前帧后自然退出，比 `thread._stop()`
-        硬杀线程安全得多（硬杀可能让 cv2/InsightFace 留下半释放的 GPU 资源）。
-    Q3: 为什么不用 asyncio.Queue？
-        识别这一侧是**同步**世界（cv2/InsightFace 是同步阻塞 API），asyncio.Queue 必须
-        在事件循环里用。queue.Queue 同步 + 线程安全，正好桥接"同步识别线程"和"async
-        ws 任务"——具体桥接见下方 `run_in_executor` 注释。
+    画面和识别解耦：
+    - 每帧都读摄像头 + 渲染 + 发 JPEG（保证画面流畅）
+    - 隔 N 帧才跑一次 detect_and_encode（节省算力）
+    - 中间帧复用上一次的 tracks 画框
     """
-    frame_id = 0
-    while not stop_event.is_set():
-        try:
-            frame = capture.read()
-        except CameraDisconnectedError as e:
-            logger.warning("摄像头断开: %s", e)
-            # 把错误塞进 queue 让 ws 任务知道
-            out_queue.put(("error", str(e)))
-            break
+    await ws.accept()
+    logger.info("WebSocket 连接建立")
 
-        tracks = use_case.process_frame(frame)
-        rendered = render_tracks(frame, tracks)
-        jpeg = encode_jpeg(rendered, quality=jpeg_quality)
+    cfg = get_config()
+    use_case = build_recognize_frame_use_case()
 
-        meta = {
-            "frame_id": frame_id,
-            "tracks": [
-                {
+    try:
+        cam = CameraCapture(
+            device_index=cfg.camera.device_index,
+            resolution=cfg.camera.resolution,
+        )
+    except CameraDisconnectedError as e:
+        await ws.send_json({"error": "CAMERA_LOST", "detail": str(e)})
+        await ws.close()
+        return
+
+    detect_interval = cfg.realtime.detect_every_n_frames
+    last_tracks: list = []
+    frame_idx = 0
+
+    try:
+        while True:
+            try:
+                frame = cam.read()
+            except CameraDisconnectedError:
+                await ws.send_json({"error": "CAMERA_LOST"})
+                break
+
+            frame_idx += 1
+
+            # 隔帧检测：只在第 1 帧和每 N 帧跑检测+识别
+            if frame_idx == 1 or frame_idx % detect_interval == 0:
+                last_tracks = use_case.process_frame(frame)
+
+            # 始终用最新 tracks 画框（无论是否跑了检测）
+            rendered = render_tracks(frame, last_tracks)
+
+            # 编码 JPEG
+            jpeg_bytes = encode_jpeg(rendered, quality=cfg.realtime.jpeg_quality)
+
+            # 发送二进制 JPEG
+            await ws.send_bytes(jpeg_bytes)
+
+            # 发送 JSON 元数据
+            track_data = []
+            for t in last_tracks:
+                track_data.append({
                     "track_id": t.track_id,
+                    "bbox": list(t.bbox),
                     "identity": t.person_id,
                     "similarity": round(t.similarity, 4),
-                    "bbox": list(t.bbox),
-                }
-                for t in tracks
-            ],
-        }
-        frame_id += 1
+                })
+            await ws.send_json({"tracks": track_data, "threshold": use_case.threshold})
 
-        # 队列满 = 前端跟不上 → 丢弃当前帧（保实时不保完整）
-        try:
-            out_queue.put_nowait(("frame", (jpeg, meta)))
-        except queue.Full:
-            try:
-                out_queue.get_nowait()  # 丢一个最老的
-            except queue.Empty:
-                pass
-            try:
-                out_queue.put_nowait(("frame", (jpeg, meta)))
-            except queue.Full:
-                pass  # 还是放不下就放弃这帧
-
-    # 注意:不在线程内 release。理由:
-    #   stop_event.set() 由 ws handler 触发,此时本线程可能阻塞在 capture.read() 上,
-    #   不会立刻看到 stop_event。让 ws handler 的 finally 先 release(OpenCV 容忍线程内
-    #   read() 的最后一次失败),再 join 等线程退出 → 摄像头句柄能被立即归还,
-    #   下次连 WS 时 VideoCapture(0).isOpened() 才会真。
-    logger.info("识别线程退出")
-
-
-@router.websocket("/ws/stream")
-async def stream_recognition(websocket: WebSocket) -> None:
-    """实时识别 WebSocket。
-
-    ── 给零基础读者的 WebSocket 速成 ──
-        WebSocket 是浏览器和服务器之间的"长连接管道"——HTTP 请求是"问一句答一句"
-        然后断开，WebSocket 是"接通后双方都能随时往里塞消息"。本项目用它的原因：
-        服务器要持续把摄像头画面（每秒几十帧）推给浏览器，HTTP 频繁建连断连开销
-        太大；WebSocket 一次握手后就常驻连接，推送几乎零延迟。
-
-        每条消息可以是文本（字符串/JSON）或二进制（bytes，比如 JPEG 字节流）。
-        WebSocket 协议**保证同一连接内消息按发送顺序到达**（底层是 TCP），
-        不会丢包也不会乱序——这是下面"先 jpeg 后 json"配对方案能成立的前提。
-
-    协议：服务端单向推送（每帧两条消息：先二进制后文本）
-        - 二进制帧：JPEG 编码的渲染图（已经画好检测框 + 名字）
-        - 文本帧：JSON {"frame_id": int, "tracks": [...]}
-
-        **frame_id 的作用**：客户端用来配对"画面"和"识别结果"。理论上 WebSocket
-        保证消息**有序到达**，所以"先 jpeg 后 json"挨着消费就能天然配对。但实践
-        中如果客户端 JS 处理慢、扔掉了一条消息，或开发期打断点导致接收顺序漂移，
-        没有 frame_id 就会出现"画面是第 N 帧、tracks 标的是第 N+1 帧"的错位
-        ——画面里的人脸框跟下面表格的姓名对不上号。
-        客户端拿到 jpeg 时记下"待匹配的 frame_id 应该是 last_meta + 1"，收到
-        json 后比较 frame_id：一致就配成一帧渲染，不一致就丢弃这一帧重新对齐。
-
-        **替代方案（更鲁棒，但带宽 +33%）**：把 jpeg 用 base64 编码塞进同一条
-        JSON：`{"frame_id": int, "tracks": [...], "jpeg_b64": "..."}` 单消息
-        发送，自然不存在配对问题。代价：base64 编码会把字节膨胀到 1.33 倍，
-        而且 JSON 解析比直接 Blob 解码慢。本项目 35 人小流量，二进制+文本方案
-        更省带宽，所以选它；高频/远程场景应优先单消息方案。
-
-    客户端：连上即开始接收，断开即停止。
-    """
-    await websocket.accept()
-    cfg = get_config()
-
-    capture = None
-    stop_event = threading.Event()
-    thread = None
-    try:
-        capture = CameraCapture(
-            device_index=cfg.camera.device_index,
-            resolution=tuple(cfg.camera.resolution),
-        )
-        use_case = build_recognize_frame_use_case()
-
-        # maxsize=2：缓冲两帧足够；过大会引入延迟（用户看到的是"过去的画面"）
-        out_queue: queue.Queue = queue.Queue(maxsize=2)
-
-        thread = threading.Thread(
-            target=_recognition_loop,
-            args=(capture, use_case, out_queue, stop_event, cfg.realtime.jpeg_quality),
-            daemon=True,  # 主进程退出时线程自动清理
-        )
-        thread.start()
-
-        # asyncio.get_event_loop() 在 Python 3.12+ 已 deprecated;
-        # 在协程内部应该用 get_running_loop()——它要求"当前必须有运行中的 loop",
-        # 调用上下文不对会立刻抛错,而不是悄悄新建一个空 loop 留下定时炸弹。
-        loop = asyncio.get_running_loop()
-        while True:
-            # ── 给小白：为什么必须 run_in_executor，不能直接 out_queue.get() ──
-            # asyncio 事件循环是**单线程**的——所有协程在一个 OS 线程里轮转。只要任
-            # 何一处**同步阻塞**（time.sleep / queue.get / 同步 IO），整个事件循环
-            # 卡住，所有 ws 连接都失去响应，新请求也无法处理。
-            # `out_queue.get()` 是**同步阻塞** API（队列空时阻塞等待），如果直接调，
-            # ws 任务会冻结整个 server。
-            # `loop.run_in_executor(executor, fn)` 把 fn 丢给**线程池**跑，并返回一
-            # 个 awaitable。我们 `await` 它时事件循环可以去服务别的连接，等线程池
-            # 跑完 fn 再回到这里继续。
-            #   - 第一个参数 `None` = 用 asyncio 默认线程池（首次调用按需创建，默认
-            #     大小 = min(32, CPU核心数 + 4)）
-            #   - 第二个参数是要跑的同步函数（这里 `out_queue.get`，不要加括号——
-            #     传函数对象本身，executor 会替我们调用它）
-            # 整体数据流：
-            #   识别线程 ─[(jpeg, meta)]→ queue.Queue ─[await loop.run_in_executor(
-            #   None, queue.get)]→ ws 协程 ─[await ws.send_*]→ 浏览器
-            # 这是 asyncio + 同步 API（cv2/InsightFace）混用的标准桥接模式。
-            kind, payload = await loop.run_in_executor(None, out_queue.get)
-            if kind == "error":
-                await websocket.send_text(json.dumps({"error": payload}))
-                break
-            jpeg, meta = payload
-            await websocket.send_bytes(jpeg)
-            await websocket.send_text(json.dumps(meta))
+            # 不 sleep：让摄像头按自己节奏出帧
+            await asyncio.sleep(0)
 
     except WebSocketDisconnect:
-        logger.info("WebSocket 客户端断开")
-    except Exception:
-        logger.exception("WebSocket 推流异常")
+        logger.info("WebSocket 断开")
+    except Exception as e:
+        logger.error(f"WebSocket 错误: {e}")
     finally:
-        # 关闭顺序:set stop → release capture → join thread。
-        # 先 release 摄像头能让阻塞在 read() 上的线程立刻醒过来抛错并退出循环;
-        # 否则线程会卡到下一次 read() 自然返回(可能是 1~33ms,也可能是数秒),
-        # join 超时静默吞掉的话句柄就泄漏了。
-        stop_event.set()
-        if capture is not None:
-            try:
-                capture.release()
-            except Exception:
-                logger.exception("capture.release 失败")
-        if thread is not None:
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                # 不要再调 release,前面已经 release 过;只 log warning 暴露异常
-                logger.warning("识别线程 2s 内未退出,可能存在阻塞调用")
+        cam.release()
 ```
 
 - [ ] **Step 3: 在 server.py 注册路由（mount StaticFiles 之前）**
