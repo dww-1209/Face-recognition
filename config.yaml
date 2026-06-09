@@ -61,9 +61,8 @@ realtime:
   # 30 FPS 下 15 帧 ≈ 0.5 秒。
   track_max_missing_frames: 15
 
-  # WebSocket 推流的 JPEG 编码质量（1=最差/最小, 100=最佳/最大）。
-  # 85 是肉眼接近无损的临界值；640×480 帧约 30~60KB，30fps 下带宽 ~10Mbps，本机回环无压力。
-  jpeg_quality: 85
+  # WebSocket 推流的 JPEG 编码质量。60 对实时预览足够，带宽更小编码更快。
+  jpeg_quality: 60
 
   # 已识别 track 经过多少帧后强制重识别一次（给 unknown 翻盘机会）。
   # 30fps 下 30 帧 ≈ 1 秒。

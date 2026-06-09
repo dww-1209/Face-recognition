@@ -8,6 +8,8 @@ import logging
 import threading
 import time
 
+import cv2
+
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from face_recognition.api.dependencies import (
@@ -75,6 +77,11 @@ async def websocket_stream(ws: WebSocket):
             except CameraDisconnectedError:
                 await ws.send_json({"error": "CAMERA_LOST"})
                 break
+
+            # macOS 上 cv2.set 改分辨率无效，手动缩到 640 保证流畅
+            h, w = frame.shape[:2]
+            if w > 640:
+                frame = cv2.resize(frame, (640, int(h * 640 / w)))
 
             # 更新最新帧（检测线程会自己来拿）
             with lock:
